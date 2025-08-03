@@ -4,10 +4,6 @@ import json
 import requests
 
 def azure_monitor_login():
-    print("\nWelcome to the Azure Monitor Logs Query Tool!")
-    print("This tool will help you run queries against Azure Monitor Logs to retrieve incident details.")
-    print("You will need to login to Azure and select the subscription and workspace you want to use.")
-    
     # Start the Azure login process
     # This will open a browser window for the user to login to Azure and get the workspace ID. 
     check_for_azure_cli_installation()  # Ensure Azure CLI is installed
