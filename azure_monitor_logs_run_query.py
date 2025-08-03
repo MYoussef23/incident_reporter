@@ -5,7 +5,7 @@ import argparse
 # Function to get the detection query results from Azure Sentinel
 def run_query(workspace_id, query, timespan):
     """
-    Query Azure Log Analytics via REST API for a specific Incident ID.
+    Query Azure Log Analytics via REST API
     """
     
     if is_token_valid("https://api.loganalytics.io"):
