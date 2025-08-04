@@ -283,41 +283,52 @@ def get_query_results_from_file():
         query_result = f.read().replace('\n', '<br />')
         return query_result
 
-#===================================================OSINT Checks===================================================#
-        
-    ### The following functions are inspired from script, OSINT_Scanner, created by Jade Hill (GitHub repo: https://github.com/jade-hill-sage/OSINT-Scanner) for performing OSINT checks in AbuseIPDB and VirusTotal.    
-
 # ------------ Load Configuration File ------------ #
 
 # Function to load the configuration from a JSON file
-def load_config(file_path="config.json"):
+def load_config(file_path):
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"Configuration file not found: {file_path}")
-    
+
+    _, ext = os.path.splitext(file_path)
+    ext = ext.lower()
+
     with open(file_path, "r") as f:
-        try:
-            config = json.load(f)
-            return config
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Error parsing the configuration file: {e}")
+        data = f.read()
+        if ext in [".yaml", ".yml"]:
+            if yaml is None:
+                raise ImportError("PyYAML is not installed. Please install it with 'pip install pyyaml'.")
+            try:
+                config = yaml.safe_load(data)
+                return config
+            except yaml.YAMLError as e:
+                raise ValueError(f"Error parsing the YAML configuration file: {e}")
+        elif ext == ".json":
+            try:
+                config = json.loads(data)
+                return config
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Error parsing the JSON configuration file: {e}")
+        else:
+            raise ValueError(f"Unsupported configuration file format: {ext}")
 
 # ------------ IOC Extraction ------------ #
 
 def extract_iocs_in_data(csv_data):     # Extract all relevant IOC's from the query result
     iocs = {
         "ips": set(),
-        "urls": set(),
         "domains": set(),
-        "hashes": set(),
-        "ip_cidrs": set()
+        "hashes": set()
         }
 
     def process_single_csv(single_csv):
         # Normalize line breaks and parse as text
-        #single_csv = single_csv.replace("<br />", ",").replace('[', '').replace(']', '').replace('"', '')
         cleaned = single_csv.replace("<br />", ",")
         # iocextract finds IOCs in arbitrary text—no need to tokenize by commas
-        iocs["ips"].update(iocextract.extract_ips(cleaned))    # Extract IPs
+        iocs["ips"].update(
+            ip for ip in iocextract.extract_ips(cleaned)
+            if osint_scanner.validate_IP(ip)  # Only keep IPs passing your check
+        )
 
         # Extract domains
         domain_regex = r'\b(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}\b'
@@ -326,7 +337,8 @@ def extract_iocs_in_data(csv_data):     # Extract all relevant IOC's from the qu
         domains = [d for d in all_domains if not re.match(r'^\d{1,3}(?:\.\d{1,3}){3}$', d)]
 
         for d in set(domains):
-            iocs["domains"].add(d)
+            if osint_scanner.validate_domain(d):
+                iocs["domains"].add(d)
 
         iocs["hashes"].update(iocextract.extract_hashes(cleaned))   # Extract hashes
 
@@ -341,301 +353,16 @@ def extract_iocs_in_data(csv_data):     # Extract all relevant IOC's from the qu
 
     return {k: list(v) for k, v in iocs.items()}
 
-# ------------ IP Validation ------------ #
-
-def validate_IP(ip, org_cidrs=None):    # Checks if an IP is public/private/invalid - returns false if not public (private/invalid)
-    try:
-        ip_obj = ipaddress.ip_address(ip)
-        # Check if it's in any of the org's public CIDRs
-        if org_cidrs:
-            for net in org_cidrs:
-                if ip_obj in net:
-                    # IP is in org's range; skip validation (return False to skip API call)
-                    return False
-        # Otherwise, return True only if IP is public (not private)
-        # Only consider as "public" if is_global (not private, not reserved, not loopback, not link-local)
-        return ip_obj.is_global
-    except ValueError:
-        return False
-
-# ------------ Domain Validation ------------ #
-
-def resolve_domain_to_ips(domain):
-    try:
-        result = socket.getaddrinfo(domain, None)
-        ips = set()
-        for entry in result:
-            ip = entry[4][0]
-            ips.add(ip)
-        return list(ips)
-    except Exception:
-        return []
-
-def validate_domain(domain, org_domains=None, org_cidrs=None):
-    """
-    Returns True if domain is valid, resolves, is not in org_domains,
-    and does not resolve to org CIDRs.
-    """
-    domain_pattern = re.compile(r"^(?!-)(?:[a-zA-Z0-9-]{1,63}\.)+[a-zA-Z]{2,}$")  # Basic domain validation regex
-    if not domain_pattern.fullmatch(domain):
-        return False
-    
-    # If org_domains is provided and matches, treat as internal/corporate
-    if org_domains:
-        d = domain.lower()
-        for od in org_domains:
-            if d == od.lower() or d.endswith("." + od.lower()):
-                return False
-    
-    # DNS resolution
-    ips = resolve_domain_to_ips(domain)
-    if not ips:
-        return False
-    
-    # If org_cidrs provided, check if any IP falls in org range
-    if org_cidrs:
-        for ip in ips:
-            try:
-                ip_obj = ipaddress.ip_address(ip)
-                for cidr in org_cidrs:
-                    if ip_obj in cidr:
-                        return False  # Domain resolves to internal IP, treat as internal
-            except Exception:
-                continue
-            
-    return True
-
-# ------------ Hash Validation ------------ #
-
-def validate_hash(val):
-    val = val.lower()
-    return (
-        len(val) in [32, 40, 64] and 
-        all(c in "0123456789abcdef" for c in val)
-    )
-    
-# ------------ VirusTotal File Hash Functions ------------ #
-
-async def fetch_file_info(api_key, file_hash):
-    async with vt.Client(api_key) as client: 
-        try:
-            file_object = client.get_object(f"/files/{file_hash}")
-            return file_object
-        except vt.error.APIError as e:
-            print(f"Error fetching info for file hash: {e}")
-            return None
-
-def print_sandbox_verdict(file_object):
-    if not file_object or not hasattr(file_object, "sandbox_verdicts"):
-        print("No sandbox verdicts available.")
-        return
-    print("Sandbox Verdicts:")
-    sandbox_verdicts = file_object.sandbox_verdicts
-    for sandbox, verdict in sandbox_verdicts.items():
-        print(f"- Sandbox: {sandbox}")
-        category = verdict.get('category', 'Unknown')
-        print(f"  Category: {category}")
-        confidence = verdict.get('confidence', 'Unknown')
-        print(f"  Confidence: {confidence}%")
-        sandbox_name = verdict.get('sandbox_name', 'Unknown')
-        print(f"  Sandbox Name: {sandbox_name}")
-        malware_classification = ';'.join(verdict.get('malware_classification', []))
-        if malware_classification:
-            print(f"  Malware Classification: {malware_classification}")
-        malware_names = ';'.join(verdict.get('malware_names', []))
-        if malware_names:
-            print(f"  Malware Names: {malware_names}")
-        print()
-    
-    sandbox_verdicts_output = f"Sandbox:{sandbox};Category:{category};Confidence:{confidence};Sandbox_Name:{sandbox_name};Malware_Classification:{malware_classification};Malware_Names:{malware_names}"
-    return sandbox_verdicts_output
-
-def loop_file_hash_vt_check(api_key, file_hashes, header=None):
-    rows = []
-    for file_hash in file_hashes:
-        print(f"Checking file hash: {file_hash}")
-        file_info = asyncio.run(fetch_file_info(api_key, file_hash))
-        if file_info:
-            if header is None:
-                header = ['file_hash', 'filename', 'file_type', 'file_size', 'last_analysis_stats', 'sandbox_verdict', 'last_analysis_date']
-            # Prepare values
-            filename = getattr(file_info, 'meaningful_name', '')
-            file_type = getattr(file_info, 'type_description', '')
-            file_size = getattr(file_info, 'size', '')
-            last_analysis_stats = getattr(file_info, 'last_analysis_stats', {})
-            stats_str = ';'.join(f"{k}:{v}" for k, v in last_analysis_stats.items())
-            last_analysis_date = getattr(file_info, 'last_analysis_date', '')
-            sandbox_verdict = print_sandbox_verdict(file_info)
-            row = [file_hash, filename, file_type, file_size, stats_str, sandbox_verdict, last_analysis_date]
-            rows.append(row)
-            # Print details for debugging/console
-            print(f'-------- Results for File Hash: {file_hash} --------')
-            print(f'Filename: {filename}')
-            print(f'File Type: {file_type}')
-            print(f'File Size: {file_size}')
-            print(f'Last Analysis Statistics: {stats_str}')
-            print(f'Last Analysis Date: {last_analysis_date}')
-            print_sandbox_verdict(file_info)
-        else:
-            print(f"Failed to retrieve data for file hash: {file_hash}")
-    return header, rows
-
-# ------------ VirusTotal Domain Functions ------------ #
-
-def get_org_domains():
-    domains = []
-    print("Enter your organisation's corporate domain(s) (e.g., company.com). Any domains you list here will be excluded from OSINT checks to avoid unnecessary analysis your own corporate domains.")
-    print("Enter one per line. Press Enter on a blank line to finish:")
-    while True:
-        domain = input("Domain: ").strip().lower()
-        if not domain:
-            break
-        # Basic check for valid domain format
-        if not re.fullmatch(r"(?!-)(?:[a-zA-Z0-9-]{1,63}\.)+[a-zA-Z]{2,}", domain):
-            print("Invalid domain, please try again.")
-            continue
-        domains.append(domain)
-    return domains
-
-async def fetch_domain_info(api_key, domain):
-    async with vt.Client(api_key) as client:
-        try:
-            vt_obj = client.get_object(f'/domains/{domain}')
-            #print(vt_obj.to_dict())
-            return vt_obj
-        except vt.error.APIError as e:
-            print(f"Error retrieving data for {domain}: {e}")
-            return None
-
-def loop_domain_vt_check(api_key, domains, header=None, org_cidrs=None):
-    if org_cidrs is None:
-        org_domins = get_org_domains()      # Get the org corp domain to exclude in domain abuse analysis
-    else:
-        org_domins = None
-    rows = []
-    for domain in domains:
-        is_not_org_domain=validate_domain(domain, org_domins, org_cidrs)    # Check if the domain is not an org domain
-        if is_not_org_domain:   # Complete domain abuse check if domain is not the org domain
-            print(f"Checking Domain: {domain}")
-            outcome = asyncio.run(fetch_domain_info(api_key, domain))
-            if outcome:
-                # Prepare header and results
-                if header is None:
-                    header = ['id', 'type', 'link', 'stats', 'last_analysis_date']
-                # Format stats as a single string: key1:val1;key2:val2
-                stats = getattr(outcome, "last_analysis_stats", {})
-                stats_str = ';'.join(f"{k}:{v}" for k, v in stats.items()) 
-                link = f"https://www.virustotal.com/gui/domain/{domain}"
-                row = [outcome.id, outcome.type, link, stats_str, getattr(outcome, "last_analysis_date", "N/A")]
-                rows.append(row)
-                # Print the URL info in json format
-                print(f'-------- Results for Domain: {domain} --------')
-                print(f'ID: {outcome.id}')
-                print(f'Type: {outcome.type}')
-                print(f'Link: {link}')
-                print(f'Last Analysis Statistics: {stats}')
-                print(f'Last Analysis Date: {getattr(outcome, "last_analysis_date", "N/A")}')
-            else:
-                print(f"Failed to retrieve data for domain: {domain}")
-    return header, rows
-
-# ------------ AbuseIPDB Functions ------------ #
-
-def get_inetnum(ip):
-    try:
-        obj = IPWhois(ip)
-        results = obj.lookup_rdap()
-        net = results.get('network', {})
-        inetnum = net.get('cidr')
-        return inetnum
-    except Exception as e:
-        print(f"WHOIS lookup failed for {ip}: {e}")
-        return None
-
-def get_org_cidrs(): # The user will be able to input their orgs public network range to avoid unnecessary OSINT checks.
-    cidrs = []
-    print("Enter your organisation's public network range(s) in CIDR notation (e.g., 203.0.113.0/24). To avoid unnecessary OSINT checks on your own IPs, any addresses within these ranges will be skipped.")
-    print("Enter one per line. Press Enter on a blank line to finish:")
-    while True:
-        cidr = input("CIDR: ").strip()
-        if not cidr:
-            break
-        try:
-            cidrs.append(ipaddress.ip_network(cidr))
-        except ValueError:
-            print("Invalid CIDR, please try again.")
-    return cidrs
-
-def abuseIP_check(ip_address, api_key):
-    url = "https://api.abuseipdb.com/api/v2/check"
-    querystring = {
-        f'ipAddress': f'{ip_address}',
-        'maxAgeInDays': '90'}
-    headers = {
-        'Accept': 'application/json',
-        'Key': f'{api_key}'}
-    response = requests.request(method='GET', url=url, headers=headers, params=querystring, verify=False)
-    return json.loads(response.text)
-
-def loop_abuseIP_check(api_key, ip_address, header=None):
-    org_cidrs = get_org_cidrs()     # Get the org network range to exclude in IP abuse analysis
-    rows = []
-    already_checked_cidrs = set()
-    skipped_ips_by_cidr = defaultdict(list)  # for the report
-    for ip in ip_address:
-        is_not_org_ip=validate_IP(ip, org_cidrs)    # Check if the IP is not an org IP
-        if is_not_org_ip:   # Complete IP abuse check if IP does not belong to the org IP range
-            cidr = get_inetnum(ip)      # Get the CIDR of the IP address
-            if cidr not in already_checked_cidrs:   # If CIDR of the IP address is not on the list
-                print(f"Checking IP: {ip}")
-                outcome = abuseIP_check(ip, api_key)
-                if outcome and 'data' in outcome:
-                    print(json.dumps(outcome, indent=2))    # Print the results
-                    if header is None:
-                        header = list(outcome['data'].keys())
-                    row = [outcome['data'].get(key, "") for key in header]
-                    rows.append(row)
-                    already_checked_cidrs.add(cidr)     # Add to already checked IP within CIDR
-                else:
-                    print(f"Failed to retrieve data for IP: {ip}")
-            else:
-               skipped_ips_by_cidr[cidr].append(ip)
-               print(f"Abuse check skipped for IP {ip}: its network range ({cidr}) has already been analysed.")
-    
-    # --- Build report summary for skipped IPs ---
-    if skipped_ips_by_cidr:
-        if len(skipped_ips_by_cidr) > 1:
-            # Add the explanatory line before the bullet list
-            skipped_ip_analysis = (
-                "<p>The following IPs were not individually checked as they belong to the already-analysed network ranges:</p>"
-                "<ul>"
-            )
-            for cidr, ips in skipped_ips_by_cidr.items():
-                ip_str = ", ".join(ips)
-                skipped_ip_analysis += f"<li><strong>{cidr}:</strong> {ip_str}</li>"
-            skipped_ip_analysis += "</ul>"
-        else:
-            # Only one CIDR: Just use a single line, no bullets
-            cidr, ips = next(iter(skipped_ips_by_cidr.items()))
-            ip_str = ", ".join(ips)
-            skipped_ip_analysis = (
-                f"<p>The following IPs were not individually checked as they belong to the already-analysed network range <strong>{cidr}</strong>: {ip_str}.</p>"
-            )
-    else:
-        skipped_ip_analysis = ""
-
-    return header, rows, org_cidrs, skipped_ip_analysis
-
 # ------------OSINT Check------------ #
 def OSINT_check(query_result):
-    # Initialize variables for OSINT checks
+    # Initialise variables for OSINT checks
     ABIPDB_analysis = ""
-    skipped_report_html = ""
+    skipped_ip_analysis = ""
     domain_analysis = ""
     hash_analysis = ""
 
     # Load configuration
-    config = load_config()
+    config = load_config('config.json')  # Load the configuration file
     VT_api_key = config["VT_api_key"]
     ABDB_api_key = config["ABDB_api_key"]
 
@@ -643,7 +370,6 @@ def OSINT_check(query_result):
     
     # set the entity lists
     ip_list = []
-    print(f"\nExtracted IPs: {iocs.get('ips', [])}")
     domain_list = []
     file_hash_list = []
         # Add IOC's to respective lists
@@ -657,7 +383,7 @@ def OSINT_check(query_result):
     if ip_list:# Perform OSINT checks for IP addresses in AbuseIPDB
         print(f"\nPerforming OSINT checks for IP addresses.")
         # Complete IP analysis - AbuseIPDB
-        header, rows, org_cidrs, skipped_report_html = osint_scanner.loop_abuseIP_check(ABDB_api_key, ip_list)
+        header, rows, org_cidrs, skipped_ips_by_cidr = osint_scanner.loop_abuseIP_check(ABDB_api_key, ip_list)
         if header and rows:
             ABIPDB_analysis = (
                 "<p><a href=https://www.abuseipdb.com/>https://www.abuseipdb.com/</a> IP Analysis:</p>"
@@ -666,6 +392,27 @@ def OSINT_check(query_result):
                     "".join("<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>" for row in rows) +
                 "</table>"
             )
+            # Prepare skipped report
+            if skipped_ips_by_cidr:
+                if len(skipped_ips_by_cidr) > 1:
+                    # Add the explanatory line before the bullet list
+                    skipped_ip_analysis = (
+                        "<p>The following IPs were not individually checked as they belong to the already-analysed network ranges:</p>"
+                        "<ul>"
+                    )
+                    for cidr, ips in skipped_ips_by_cidr.items():
+                        ip_str = ", ".join(ips)
+                        skipped_ip_analysis += f"<li><strong>{cidr}:</strong> {ip_str}</li>"
+                    skipped_ip_analysis += "</ul>"
+                else:
+                    # Only one CIDR: Just use a single line, no bullets
+                    cidr, ips = next(iter(skipped_ips_by_cidr.items()))
+                    ip_str = ", ".join(ips)
+                    skipped_ip_analysis = (
+                        f"<p>The following IPs were not individually checked as they belong to the already-analysed network range <strong>{cidr}</strong>: {ip_str}.</p>"
+                    )
+            else:
+                skipped_ip_analysis = ""
 
         # Domain Analysis - VirusTotal
     if domain_list:
@@ -702,7 +449,7 @@ def OSINT_check(query_result):
                 "</table>"
             )
 
-    return ABIPDB_analysis, skipped_report_html, domain_analysis, hash_analysis
+    return ABIPDB_analysis, skipped_ip_analysis, domain_analysis, hash_analysis
 
 def prepare_results(result):  # Ensure result is in the expected format
     # Extract and return fields
@@ -877,7 +624,6 @@ if __name__ == '__main__':
             print("\nYou have selected to use Azure Monitor Logs. Please ensure you have the necessary permissions to access the logs (recommended minimum: Log Analytics Reader role on the workspace).")
                 # Run the azure_monitor_login CLI to login to Azure to get the workspace ID
             workspace_id = azure_monitor_get_workspace.azure_monitor_login()
-            #workspace_id = azure_monitor_login()
                 
                 # Get the incident details
             incident_no = get_valid_incident_id()
@@ -885,8 +631,7 @@ if __name__ == '__main__':
                 # Get the detection details including start time, end time, and query
             print(f"\nRetrieving detection details for incident ID: {incident_no} in workspace ID: {workspace_id}")
                 # Load the configuration file to get the queries for incident details
-            with open('config.yaml') as f:
-                config = yaml.safe_load(f)
+            config = load_config('config.yaml')  # Load the configuration file
 
             query = config['incident_details_query'].format(incident_no=incident_no)
             result = azure_monitor_logs_run_query.run_query(workspace_id, query, timespan="P1D")  # Run the query to get the incident details
