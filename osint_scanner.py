@@ -7,6 +7,10 @@ import json
 import requests
 from ipwhois import IPWhois
 from collections import defaultdict
+import argparse
+import sys
+
+### This module is inspired from script, OSINT_Scanner, created by Jade Hill (GitHub repo: https://github.com/jade-hill-sage/OSINT-Scanner) for performing OSINT checks in AbuseIPDB and VirusTotal.    
 
 # ------------ IP Validation ------------ #
 
@@ -269,26 +273,55 @@ def loop_abuseIP_check(api_key, ip_address, header=None):
                skipped_ips_by_cidr[cidr].append(ip)
                print(f"Abuse check skipped for IP {ip}: its network range ({cidr}) has already been analysed.")
     
-    # --- Build report summary for skipped IPs ---
-    if skipped_ips_by_cidr:
-        if len(skipped_ips_by_cidr) > 1:
-            # Add the explanatory line before the bullet list
-            skipped_ip_analysis = (
-                "<p>The following IPs were not individually checked as they belong to the already-analysed network ranges:</p>"
-                "<ul>"
-            )
-            for cidr, ips in skipped_ips_by_cidr.items():
-                ip_str = ", ".join(ips)
-                skipped_ip_analysis += f"<li><strong>{cidr}:</strong> {ip_str}</li>"
-            skipped_ip_analysis += "</ul>"
-        else:
-            # Only one CIDR: Just use a single line, no bullets
-            cidr, ips = next(iter(skipped_ips_by_cidr.items()))
-            ip_str = ", ".join(ips)
-            skipped_ip_analysis = (
-                f"<p>The following IPs were not individually checked as they belong to the already-analysed network range <strong>{cidr}</strong>: {ip_str}.</p>"
-            )
-    else:
-        skipped_ip_analysis = ""
+    return header, rows, org_cidrs, skipped_ips_by_cidr
 
-    return header, rows, org_cidrs, skipped_ip_analysis
+def main():
+    parser = argparse.ArgumentParser(
+        description="OSINT Scanner for IPs, domains, and hashes using AbuseIPDB and VirusTotal."
+    )
+    parser.add_argument("--mode", required=True, choices=["ip", "domain", "hash"], help="Scan mode: ip, domain, or hash")
+    parser.add_argument("--targets", nargs="+", required=True, help="Space-separated list of IPs, domains, or hashes")
+    parser.add_argument("--vt-api-key", help="VirusTotal API Key (required for domain/hash modes)")
+    parser.add_argument("--abuseipdb-api-key", help="AbuseIPDB API Key (required for ip mode)")
+
+    args = parser.parse_args()
+
+    # IP mode
+    if args.mode == "ip":
+        if not args.abuseipdb_api_key:
+            print("Error: --abuseipdb-api-key is required for IP mode.")
+            sys.exit(1)
+        header, rows, org_cidrs, skipped_ips_by_cidr = loop_abuseIP_check(
+            args.abuseipdb_api_key, args.targets
+        )
+        print("\nAbuseIPDB Results:")
+        print(header)
+        for row in rows:
+            print(row)
+        if skipped_ips_by_cidr:
+            print("Skipped IPs by CIDR:", dict(skipped_ips_by_cidr))
+
+    # Domain mode
+    elif args.mode == "domain":
+        if not args.vt_api_key:
+            print("Error: --vt-api-key is required for domain mode.")
+            sys.exit(1)
+        header, rows = loop_domain_vt_check(args.vt_api_key, args.targets)
+        print("\nVirusTotal Domain Results:")
+        print(header)
+        for row in rows:
+            print(row)
+
+    # Hash mode
+    elif args.mode == "hash":
+        if not args.vt_api_key:
+            print("Error: --vt-api-key is required for hash mode.")
+            sys.exit(1)
+        header, rows = loop_file_hash_vt_check(args.vt_api_key, args.targets)
+        print("\nVirusTotal Hash Results:")
+        print(header)
+        for row in rows:
+            print(row)
+
+if __name__ == "__main__":
+    main()
