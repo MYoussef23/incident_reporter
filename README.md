@@ -1,1 +1,1 @@
-# Indcident_Documenter
+# Incident Reporter Tool
