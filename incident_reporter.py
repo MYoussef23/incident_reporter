@@ -360,6 +360,7 @@ def OSINT_check(query_result):
     skipped_ip_analysis = ""
     domain_analysis = ""
     hash_analysis = ""
+    org_cidrs = None        # Initialise org_cidrs to None for AbuseIPDB/VT domain checks
 
     # Load configuration
     config = load_config('config.json')  # Load the configuration file
@@ -477,8 +478,8 @@ def prepare_results(result):  # Ensure result is in the expected format
             "Tactics": tactics,
             "Techniques": techniques
         })
-    
-    return alerts, alerts[0]['AlertId']   # Return the list of alerts for further processing
+
+    return alerts, alerts[0]['AlertId']  # Return the list of alerts for further processing
 
 def run_detection_queries_on_alerts(alerts, workspace_id, alert_link_query):  # Run detection queries on the alerts
     all_query_results = []
@@ -493,7 +494,7 @@ def run_detection_queries_on_alerts(alerts, workspace_id, alert_link_query):  # 
         tactics = alert["Tactics"]
         techniques = alert["Techniques"]
 
-        if product_name == "Azure Sentinel":
+        if product_name.lower().endswith("sentinel"):    # If the product name ends with "Sentinel", run the detection query
             print(f"\nRunning detection query for Alert {idx}: {incident_title} ({alert_id})")
             timespan = f"{start_time_utc}/{end_time_utc}"
             query_table = azure_monitor_logs_run_query.run_query(workspace_id, detection_query, timespan)
@@ -523,16 +524,16 @@ def run_detection_queries_on_alerts(alerts, workspace_id, alert_link_query):  # 
                 # Support for multiple links, though usually just one per alert
                 for row in alert_links["rows"]:
                     alert_link = row[0]
-                    print(f"\nAlert Link for Alert {idx}: {incident_title} ({alert_id})\n{alert_link}")
+                    print(f"\nAlert Link for Alert {idx} ({product_name}): {incident_title} ({alert_id}\n{alert_link}")
 
                     # format as HTML hyperlink
-                    html_link = f'<p><a href="{alert_link}" target="_blank">{alert_link}</a></p>'
+                    html_link = f'<p>{product_name}: <a href="{alert_link}" target="_blank">{alert_link}</a></p>'
                     all_query_results.append(html_link)
             else:
-                print(f"No alert link found for Alert {idx}: {incident_title} ({alert_id})")
-                all_query_results.append(f"No alert link found for this alert in {product_name}")
+                print(f"No alert link found for Alert {idx} ({product_name}): {incident_title} ({alert_id})")
+                all_query_results.append(f"<p>No alert link found for this alert in {product_name}</p>")
     
-    return alerts[0]["IncidentTitle"], all_query_results, tactics, techniques
+    return alerts[0]["IncidentTitle"], all_query_results, tactics, techniques, product_name
 
 # ------------ HTML Output Functions ------------ #
 def generate_html_report(Incident_no, Incident_title, query_result, ABIPDB_analysis, skipped_ip_analysis, domain_analysis, file_hash_analysis, mitre_attack_map):
@@ -544,13 +545,16 @@ def generate_html_report(Incident_no, Incident_title, query_result, ABIPDB_analy
         osint_checks = f"{ABIPDB_analysis}{skipped_ip_analysis}{domain_analysis}{file_hash_analysis}"
     
     # If query_result is a list (where multiple detection queries was run), join its items; if not, just use it directly
-    if isinstance(query_result, list):
+    if isinstance(query_result, list) and all("<p>" not in str(item) for item in query_result):
         # Add a separator or header for clarity if desired:
         qr_string = "<pre>" + "<br /><br />".join(str(q) for q in query_result if str(q).strip()) + "</pre>"
+    elif isinstance(query_result, list) and any("<p>" in str(item) for item in query_result):
+        # If query_result is a list with HTML links, join them as they are as they already have <p> tags
+        qr_string = "".join(str(item) for item in query_result if str(item).strip())
     elif "<br />" in str(query_result): # If query_result is a table
         qr_string = "<pre>" + str(query_result) + "</pre>"
-    else:   # if query_table is an alert link
-        qr_string = "<p>" + str(query_result) + "</p>"
+    elif "<p>" in str(query_result):   # if query_table is an alert link
+        qr_string = str(query_result)
 
     html_content = html_content = f"""<h1>Incident: {Incident_no} - {Incident_title}</h1>
     <h2>Events</h2>
@@ -578,8 +582,8 @@ def main_menu():
         
         if choice == '1':
             # Handle Azure Monitor Logs
-            user_selection = input("You have selected to use Azure Monitor Logs. Do you wish to continue?\n " \
-                                    "Enter 'yes' to continue or 'no' to return to the main menu: ").strip().lower()
+            user_selection = input("You have selected to use Azure Monitor Logs. Do you wish to continue? (Y/N)\n " \
+                                    "Enter 'Y' to continue or 'N' to return to the main menu: ").strip().lower()
             while user_selection not in ['yes', 'y', 'no', 'n']:
                 user_selection = input("Invalid selection. Please enter 'yes' or 'no': ").strip().lower()
             if user_selection in ['no', 'n']:
@@ -589,10 +593,10 @@ def main_menu():
                 return '1'  # Return to indicate Azure Monitor Logs selection
         elif choice == '2':
             # Handle CSV file input
-            user_selection = input("You have selected to use a CSV file containing the query results. Do you wish to continue?\n " \
-                                    "Enter 'yes' to continue or 'no' to return to the main menu: ").strip().lower()
+            user_selection = input("You have selected to use a CSV file containing the query results. Do you wish to continue? (Y/N)\n " \
+                                    "Enter 'Y' to continue or 'N' to return to the main menu: ").strip().lower()
             while user_selection not in ['yes', 'y', 'no', 'n']:
-                user_selection = input("Invalid selection. Please enter 'yes' or 'no': ").strip().lower()
+                user_selection = input("Invalid selection. Please enter 'Y' or 'N': ").strip().lower()
             if user_selection in ['no', 'n']:
                 print("Returning to the main menu...")
                 continue
@@ -608,6 +612,7 @@ if __name__ == '__main__':
     try:
         # Install the required libraries from requirements.txt if not already installed
         install_requirements()
+        osint_checks = False # Flag to indicate if OSINT checks are performed
 
         # Allow the user to login to Azure and add the workspaces to a variable for user selection
         print("\nWelcome to the Alert Documentation Tool!")
@@ -634,7 +639,7 @@ if __name__ == '__main__':
             config = load_config('config.yaml')  # Load the configuration file
 
             query = config['incident_details_query'].format(incident_no=incident_no)
-            result = azure_monitor_logs_run_query.run_query(workspace_id, query, timespan="P1D")  # Run the query to get the incident details
+            result = azure_monitor_logs_run_query.run_query(workspace_id, query, timespan="P30D")  # Run the query to get the incident details
     
             if not result.get("rows"):
                 print("No results returned. Changing the time range from 1 day to 7 days")
@@ -646,7 +651,11 @@ if __name__ == '__main__':
             alerts, alert_id = prepare_results(result)  # Ensure result is in the expected format
             
             query = config['get_alert_link_query'].format(alert_id=alert_id)
-            incident_title, query_result, tactics, techniques = run_detection_queries_on_alerts(alerts, workspace_id, query)  # Run detection queries on the alerts
+            incident_title, query_result, tactics, techniques, product_name = run_detection_queries_on_alerts(alerts, workspace_id, query)  # Run detection queries on the alerts
+            if product_name.lower().endswith("sentinel"):
+                osint_checks = True # Set the flag to indicate OSINT checks will be performed on those alerts where the alert is from Sentinel
+            else:
+                osint_checks = False  # Set the flag to indicate OSINT checks will not be performed on those alerts where the alert is not from Sentinel
             
             #mitre_attack_map = mitre_attack_html_section(tactics, techniques)
             mitre_attack_map = ""
@@ -656,15 +665,22 @@ if __name__ == '__main__':
             print("Please enter the incident number and title for the report.")
             incident_no = input("Incident Number: ").strip()
             incident_title = input("Incident Title: ").strip()
+            osint_checks = True  # Set the flag to indicate OSINT checks will be performed
             mitre_attack_map = ""
         elif user_selection == '3':
             print("Exiting the tool. Goodbye!")
             exit(0)
-            
-        # Apply nest_asyncio to allow nested event loops
-        nest_asyncio.apply()
-        #ABIPDB_analysis, skipped_ip_analysis, domain_analysis, hash_analysis = asyncio.run(OSINT_check(query_result))  # Perform the OSINT checks
-        ABIPDB_analysis, skipped_ip_analysis, domain_analysis, hash_analysis = OSINT_check(query_result)  # Perform the OSINT checks
+        
+        if osint_checks:        # Perform OSINT checks if the flag is set
+            # Apply nest_asyncio to allow nested event loops
+            nest_asyncio.apply()
+            #ABIPDB_analysis, skipped_ip_analysis, domain_analysis, hash_analysis = asyncio.run(OSINT_check(query_result))  # Perform the OSINT checks
+            ABIPDB_analysis, skipped_ip_analysis, domain_analysis, hash_analysis = OSINT_check(query_result)  # Perform the OSINT checks
+        else:       # If OSINT checks are not performed, set the analysis variables to empty strings
+            ABIPDB_analysis = ""
+            skipped_ip_analysis = ""
+            domain_analysis = ""
+            hash_analysis = ""
 
         # Build the HTML content
             # Create an HTML file with the content and save it
