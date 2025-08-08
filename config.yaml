@@ -1,0 +1,46 @@
+incident_details_query: |
+  SecurityIncident
+    | where IncidentNumber == '{incident_no}'
+    | mv-expand AlertIds
+    | extend AlertIdStr = tostring(AlertIds)
+    | project IncidentNumber, AlertIdStr, Title
+    | join kind=inner (
+        SecurityAlert
+        | project ProductName, SystemAlertId, ExtendedProperties, Tactics, Techniques
+    ) on $left.AlertIdStr == $right.SystemAlertId
+    | extend 
+        QueryStartTimeUTC = parse_json(ExtendedProperties)["Query Start Time UTC"], 
+        QueryEndTimeUTC = parse_json(ExtendedProperties)["Query End Time UTC"], 
+        Query = parse_json(ExtendedProperties)["Query"]
+    | summarize
+        AlertIds = make_set(AlertIdStr),
+        Titles = make_set(Title),
+        StartTimes = make_set(QueryStartTimeUTC), 
+        EndTimes = make_set(QueryEndTimeUTC), 
+        Queries = make_set(Query)
+        by ProductName, AlertIdStr, Tactics, Techniques
+    // Expand each set so you get one row per alert within the incident
+    | mv-expand AlertIds, Titles, StartTimes, EndTimes, Queries
+    | project Titles, ProductName, AlertIds, StartTimes, EndTimes, Queries, Tactics, Techniques
+
+get_alert_link_query: |
+  SecurityAlert
+    | summarize arg_max(TimeGenerated, *) by SystemAlertId
+    | where SystemAlertId in('{alert_id}')
+    | project AlertLink
+
+PROMPT_TEMPLATE_WITH_ALERT_DETAILS: |
+  Given the following security alert and context, determine the most relevant MITRE ATT&CK technique(s):
+
+  Alert Title: {alert_title}
+  Detection Query: {detection_data}
+
+  Respond as a list of technique ID's. Only show relevant technique(s) and only output the technique number(s) (no extra text or explanations).
+
+PROMPT_TEMPLATE_WITH_DETECTION_DATA: |
+  Given the following security alert and context, determine the most relevant MITRE ATT&CK technique(s):
+
+  Alert Title: {alert_title}
+  Detection Data: {detection_data}
+
+  Respond as a list of technique ID's. Only show relevant technique(s) and only output the technique number(s) (no extra text or explanations).
