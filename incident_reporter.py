@@ -17,6 +17,7 @@ import iocextract
 import osint_scanner
 import get_mitre_attack_details
 import mitre_ollama_prompt
+import webbrowser 
 import nest_asyncio
 import subprocess
 import warnings
@@ -26,22 +27,6 @@ import pandas as pd
 import win32com.client
 
 warnings.simplefilter('ignore', InsecureRequestWarning)
-
-# Function to install requirements from a requirements.txt file
-def install_requirements():
-    req_file = os.path.join(os.path.dirname(__file__), "requirements.txt")
-    if os.path.exists(req_file):
-        try:
-            import pkg_resources
-            with open(req_file) as f:
-                packages = [line.strip() for line in f if line.strip() and not line.startswith("#")]
-            installed = {pkg.key for pkg in pkg_resources.working_set}
-            missing = [pkg for pkg in packages if pkg.split("==")[0].lower() not in installed]
-            if missing:
-                print(f"Installing missing packages: {missing}")
-                subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
-        except Exception as e:
-            print(f"Could not check/install requirements: {e}")
 
 def close_excel_with_file_open(filename):
     try:
@@ -88,11 +73,14 @@ def get_incident_number():      # This will loop till the user enters a valid en
             except ValueError:
                 print("Please enter a valid numeric Incident ID.")
 
-def save_to_csv(table, filename):
+def save_to_csv(table, filename_csv, filename_json):
     # put table data in dataframe
     df = pd.DataFrame(table["rows"], columns=[col["name"] for col in table["columns"]])
     # Save dataframe as CSV
-    df.to_csv(filename, index=False)
+    df.to_csv(filename_csv, index=False)
+    # Save only the first 5 rows of the dataframe as JSON
+    df.head().to_json(filename_json, orient="records", indent=2)
+
 
 #===================================================Query Results From File===================================================#
     
@@ -277,6 +265,8 @@ def OSINT_check(query_result):
                     "".join("<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>" for row in rows) +
                 "</table>"
             )
+        else:
+            print("No external domains to check.")
 
         # File hash - VirusTotal
     if file_hash_list:
@@ -345,7 +335,8 @@ def run_detection_queries_on_alerts(alerts, workspace_id, alert_link_query):  # 
 
             # Export results to CSV (unique file for each alert)
             csv_filename = f"query_table_alert_{idx}.csv"
-            save_to_csv(query_table, csv_filename)
+            json_filename = f"query_table_alert_{idx}.json"
+            save_to_csv(query_table, csv_filename, json_filename)
             print(f"\nQuery result saved to {csv_filename}")
 
             # Open the file in default CSV viewer
@@ -377,7 +368,7 @@ def run_detection_queries_on_alerts(alerts, workspace_id, alert_link_query):  # 
                 print(f"No alert link found for Alert {idx} ({product_name}): {incident_title} ({alert_id})")
                 all_query_results.append(f"<p>No alert link found for this alert in {product_name}</p>")
     
-    return alerts[0]["IncidentTitle"], all_query_results, tactics, techniques, product_name
+    return alerts[0]["IncidentTitle"], all_query_results, tactics, techniques, product_name, detection_query
 
 # ------------ HTML Output Functions ------------ #
 def generate_html_report(Incident_no, Incident_title, query_result, ABIPDB_analysis, skipped_ip_analysis, domain_analysis, file_hash_analysis, mitre_attack_map):
@@ -420,7 +411,7 @@ def main_menu():
     while True:
         print("\nMain Menu:")
         print("1. Use Azure Monitor Logs to obtain the detection query results")
-        print("2. Use a CSV file containing the query results")
+        print("2. Use a CSV file containing the query results or enter event details manually (you will be prompted if you wish to select a CSV file or enter the event details manually using text input)")
         print("3. Exit the tool")
         choice = input("Enter your choice (1/2/3): ").strip()
         
@@ -454,8 +445,6 @@ def main_menu():
 
 if __name__ == '__main__':
     try:
-        # Install the required libraries from requirements.txt if not already installed
-        install_requirements()
         osint_checks = False # Flag to indicate if OSINT checks are performed
 
         # Allow the user to login to Azure and add the workspaces to a variable for user selection
@@ -495,26 +484,79 @@ if __name__ == '__main__':
             alerts, alert_id = prepare_results(result)  # Ensure result is in the expected format
             
             query = config['get_alert_link_query'].format(alert_id=alert_id)
-            incident_title, query_result, tactics, techniques, product_name = run_detection_queries_on_alerts(alerts, workspace_id, query)  # Run detection queries on the alerts
+            incident_title, query_result, tactics, techniques, product_name, detection_query = run_detection_queries_on_alerts(alerts, workspace_id, query)  # Run detection queries on the alerts
             if product_name.lower().endswith("sentinel"):
                 osint_checks = True # Set the flag to indicate OSINT checks will be performed on those alerts where the alert is from Sentinel
             else:
                 osint_checks = False  # Set the flag to indicate OSINT checks will not be performed on those alerts where the alert is not from Sentinel
             
-            print(f"Techniques being passed: {techniques} (type: {type(techniques)})")
+            #print(f"Techniques being passed: {techniques} (type: {type(techniques)})")
 
+            #  make sure techniques is a list
             if isinstance(techniques, str):
                 # If techniques is a string representation of a list, use ast.literal_eval
                 try:
                     techniques = ast.literal_eval(techniques)
                 except Exception:
                     techniques = [t.strip() for t in techniques.split(",") if t.strip()]
+            
+            # # Try to find other techniques related to the alert using LLM prompt
+            print(f"\nAttempting to find additional MITRE ATT&CK techniques related to the alert: {incident_title}")
+            config = load_config('config.json')  # Load the configuration file to get the OpenAI API key
+            openai_api_key = config['OpenAI_api_key']
+            # Prompt the public LLM to find MITRE ATT&CK techniques related to the incident as no senstive data is being passed
+            techniques_llm = mitre_ollama_prompt.mitre_mapper(incident_title, detection_query, provider="openai", openai_api_key=openai_api_key)       # Uncomment this line to use OpenAI API
+            #techniques_llm = mitre_ollama_prompt.mitre_mapper(incident_title, detection_query, provider="ollama")       # Uncomment this line to use Ollama API
+            # Print the techniques_llm to see what it returns
+            print(f"Techniques from LLM: {techniques_llm} (type: {type(techniques_llm)})")
+            # make techniques_llm a list if it is a string
+            if isinstance(techniques_llm, str):
+                techniques_llm = [t.strip() for t in techniques_llm.split(",") if t.strip()]
+            elif isinstance(techniques_llm, list):
+                # Flatten any comma-separated strings in the list
+                flat_techniques_llm = []
+                for t in techniques_llm:
+                    flat_techniques_llm.extend([x.strip() for x in t.split(",") if x.strip()])
+                techniques_llm = flat_techniques_llm
+            # add the techniques_llm to the techniques list
+            if techniques_llm:
+                techniques.extend(techniques_llm)
+            # Remove duplicates from techniques
+            techniques = list(set(techniques))
+
+            # Complete the MITRE ATT&CK mapping and HTML output
+            print(f"\nPerforming MITRE ATT&CK mapping for techniques: {techniques}")
             mitre_attack_map = get_mitre_attack_details.mitre_attack_html_section(techniques)
             #mitre_attack_map = ""
 
         elif user_selection == '2':
-            print("Please ensure that the CSV file is in the correct format and contains the necessary data.")
-            query_result, query_result_json = get_query_results_from_file()  # Get the query results from the CSV file
+            csv_data_or_text = input("Do you wish to select a CSV file containing the query results or paste the incident details as text? (Enter 'csv' for file or 'text' for text): ").strip().lower()
+            while csv_data_or_text not in ['csv', 'text']:
+                csv_data_or_text = input("Invalid selection. Please enter 'csv' for file or 'text' for text: ").strip().lower()
+            if csv_data_or_text == 'csv':
+                # Close any instances of the query_table.csv file before proceeding
+                close_excel_with_file_open("query_table")
+                # Get the query results from the CSV file
+                query_result, query_result_json = get_query_results_from_file()
+            else:
+                # If the user chooses to paste the incident details as text, prompt for the text input
+                print("Please paste the incident details below (end with an empty line):")
+                query_result = ""
+                while True:
+                    line = input()
+                    if line.strip() == "":
+                        break
+                    query_result += line + "<br />"
+                query_result = query_result.strip()
+                query_result_json = query_result        # for consistency, set query_result_json to the same value as query_result for mitre_attack_details
+            
+            # Check if the query result is empty
+            if not query_result:
+                print("No query results found. Please ensure that the CSV file is in the correct format and contains the necessary data.")
+                exit(1)
+
+            # print("Please ensure that the CSV file is in the correct format and contains the necessary data.")
+            # query_result, query_result_json = get_query_results_from_file()  # Get the query results from the CSV file
             print("Please enter the incident number and title for the report.")
             incident_no = input("Incident Number: ").strip()
             incident_title = input("Incident Title: ").strip()
@@ -522,7 +564,8 @@ if __name__ == '__main__':
             #mitre_attack_map = ""
             
             # Prompt for MITRE ATT&CK techniques
-            techniques = mitre_ollama_prompt.main(incident_title, query_result_json)
+            print(f"\nAttempting to find MITRE ATT&CK techniques related to the incident: {incident_title}")
+            techniques = mitre_ollama_prompt.mitre_mapper(incident_title, query_result_json, provider="ollama")  # Use OpenAI API to find techniques
             if isinstance(techniques, str):
                 techniques = [t.strip() for t in techniques.split(",") if t.strip()]
             elif isinstance(techniques, list):
@@ -534,6 +577,8 @@ if __name__ == '__main__':
 
             #mitre_attack_map = get_mitre_attack_details.find_matching_techniques(incident_title, query_result)
             mitre_attack_map = get_mitre_attack_details.mitre_attack_html_section(techniques)
+
+            print(query_result)
 
         elif user_selection == '3':
             print("Exiting the tool. Goodbye!")
@@ -554,11 +599,10 @@ if __name__ == '__main__':
             # Create an HTML file with the content and save it
         with open("sample.html", "w", encoding="utf-8") as file:
             file.write(generate_html_report(incident_no, incident_title, query_result, ABIPDB_analysis, skipped_ip_analysis, domain_analysis, hash_analysis, mitre_attack_map))
-        print("\nHTML file 'sample.html' created successfully. \n" \
-                "Ensure you close any open instances of the file before running the script again.")
+        print("\nHTML file 'sample.html' created successfully.")
 
         # open the HTML file in notepad
-        os.system("notepad sample.html")
+        webbrowser.open("sample.html")
 
     except Exception as e:
         print(f"Execution error: {e}")
