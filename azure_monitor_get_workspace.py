@@ -2,6 +2,7 @@ import os
 import subprocess
 import json
 import requests
+import beep
 
 def azure_monitor_login():
     # Start the Azure login process
@@ -74,6 +75,7 @@ def prompt_change_subscription(current_sub):
     print(f"\nCurrent Subscription: {current_sub['name']}")
     print(f"Subscription ID: {current_sub['id']}")
     while True:
+        beep.beep()     # Play a notification sound for user attention
         answer = input("Do you want to continue using this subscription? (Y/N): ").strip().lower()
         if answer in ('y', 'yes', 'n', 'no'):
             return answer in ('y', 'yes')
@@ -119,6 +121,7 @@ def list_and_select_subscription(account_name):
             print(f"{i}: {sub['name']} ({sub['id']})")
 
         while True:
+            beep.beep()     # Play a notification sound for user attention
             idx_input = input("Enter the number for the subscription to switch to: ").strip()
             if not idx_input.isdigit():
                 print("Please enter a valid number.")
@@ -170,6 +173,7 @@ def list_and_select_workspace(current_sub_id):  # This will list all the workspa
     for i, ws in enumerate(wss):
         print(f"{i + 1}: Workspace Name: {ws.get('name', 'Unknown')} | Customer ID: {ws.get('customerId', 'N/A')}")
     while True:
+        beep.beep()     # Play a notification sound for user attention
         idx = input("Enter the number of the workspace to use: ")
         try:
             idx = int(idx) - 1
@@ -203,15 +207,14 @@ def is_token_valid(resource):
            return False 
         return True
     except subprocess.CalledProcessError as e:
-        #print(f"Access token retrieval failed for {resource}. Output:\n{e.output}")
         return False
     except requests.RequestException as e:
-        #print(f"Request failed during token validation for {resource}: {e}")
         return False
 
 def prompt_change_account(account):
     print(f"Current Azure account: {account}")
     while True:
+        beep.beep()     # Play a notification sound for user attention
         answer = input("Do you want to continue using this account? (Y/N): ").strip().lower()
         if answer in ('y', 'yes', 'n', 'no'):
             return answer in ('y', 'yes')
@@ -240,5 +243,8 @@ def get_access_token(resource):
         return None
     
 if __name__ == "__main__":
-    # Run the Azure Monitor login function to get the workspace ID
-    azure_monitor_login()
+    workspace_id = azure_monitor_login()
+    if workspace_id:
+        print(f"Workspace ID: {workspace_id}")
+    else:
+        print("No workspace selected. Exiting.")
