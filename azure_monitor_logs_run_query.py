@@ -1,6 +1,7 @@
 import subprocess
 import requests
 import argparse
+import beep
 
 # Function to get the detection query results from Azure Sentinel
 def run_query(workspace_id, query, timespan):
@@ -56,10 +57,8 @@ def is_token_valid(resource):
            return False 
         return True
     except subprocess.CalledProcessError as e:
-        #print(f"Access token retrieval failed for {resource}. Output:\n{e.output}")
         return False
     except requests.RequestException as e:
-        #print(f"Request failed during token validation for {resource}: {e}")
         return False
     
 def get_access_token(resource):
@@ -115,10 +114,12 @@ def get_azure_account_name():
 def prompt_change_account(account):
     print(f"Current Azure account: {account}")
     while True:
+        beep.beep()     # Play a notification sound for user attention
         answer = input("Do you want to continue using this account? (Y/N): ").strip().lower()
         if answer in ('y', 'yes', 'n', 'no'):
             return answer in ('y', 'yes')
         else:
+            beep.beep()     # Play a notification sound for user attention
             print("Please enter 'y' for yes or 'n' for no.")
 
 def Azure_scope_login(scope):
