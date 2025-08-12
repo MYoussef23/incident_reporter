@@ -57,10 +57,13 @@ def build_lookups(attack_store):
         }
     return techniques, tactic_lookup
 
-# Load MITRE ATT&CK Enterprise Matrix (latest version)
 def mitre_attack_html_section(techniques):
     """
-    Returns an HTML section listing MITRE ATT&CK tactics and techniques, mapped per technique.
+    Returns an HTML section listing MITRE ATT&CK tactics and techniques, 
+    mapped per technique ID and description.
+
+    Parameters:
+        techniques (list of tuple): List of (technique_id, description).
     """
 
     # Define matrices
@@ -70,6 +73,10 @@ def mitre_attack_html_section(techniques):
         "mobile-attack": "Mobile",
     }
 
+    # Extract technique IDs and description mapping
+    tech_ids = [tech_id.strip() for tech_id, _ in techniques]
+    descriptions_map = {tech_id.strip(): desc.strip() for tech_id, desc in techniques}
+
     # Build the full table across all domains
     rows = []
     for matrix_key, matrix_name in matrices.items():
@@ -78,87 +85,68 @@ def mitre_attack_html_section(techniques):
         except Exception as e:
             print(f"Error loading {matrix_key}: {e}")
             continue
+
         techs, tactic_lookup = build_lookups(attack_store)
+
         for tech in techs.values():
             tech_id = tech['tech_id']
             tech_name = tech['name']
             tech_url = tech.get('url', '')
             tactics = [tactic_lookup.get(t, t) for t in tech['tactics']]
-            # Embed the URL as a clickable link in the Technique column
+
+            # Embed the URL as a clickable link
             if tech_url:
                 technique_display = f'<a href="{tech_url}" target="_blank">{tech_id}: {tech_name}</a>'
+            else:
+                technique_display = f"{tech_id}: {tech_name}"
+
             rows.append({
                 "Matrix": matrix_name,
                 "Tactic": ", ".join(tactics),
                 "Technique": technique_display,
-                "TechID": tech_id  # for filtering
+                "TechID": tech_id,
+                "Relevance to the Alert": descriptions_map.get(tech_id, "")
             })
-    # Create DataFrame
-    df = pd.DataFrame(rows, columns=[
-        "Matrix", "Tactic", "Technique", "TechID"
-    ])
 
-    html_h2 = "<h2>MITRE ATT&CK Mapping</h2>"
-    
-    # Filter by technique code using the new column
-    mask_tech = df["TechID"].isin(techniques)
+    # Create DataFrame
+    df = pd.DataFrame(rows, columns=["Matrix", "Tactic", "Technique", "TechID", "Relevance to the Alert"])
+
+    # Filter by technique ID
+    mask_tech = df["TechID"].isin(tech_ids)
     filtered_df = df[mask_tech]
 
-    # Drop the TechID column before displaying/saving
-    filtered_df = filtered_df.drop(columns=["TechID"])
+    # Save CSV without TechID column
+    filtered_df.drop(columns=["TechID"], inplace=True)
     filtered_df.to_csv("mitre_techniques_filtered.csv", index=False, encoding="utf-8")
 
-    # Display as HTML table
+    # Build HTML table
+    html_h2 = "<h2>MITRE ATT&CK Mapping</h2>"
     html_table = f"{html_h2}\n{filtered_df.to_html(index=False, escape=False)}"
-    # print(html_table)     # For debugging, you can uncomment this line to see the HTML output in console
-    print("Matrix | Tactic | Technique | URL")
+
+    # Console print
+    print("Matrix | Tactic | Technique | Relevance to the Alert | URL")
     for _, row in filtered_df.iterrows():
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(row['Technique'], 'html.parser')
         link = soup.a['href'] if soup.a else ''
         text = soup.a.text if soup.a else row['Technique']
-        print(f"{row['Matrix']} | {row['Tactic']} | {text} | {link}")
+        print(f"{row['Matrix']} | {row['Tactic']} | {text} | {row['Relevance to the Alert']} | {link}")
 
     return html_table
 
-# For debugging, you can uncomment the following lines to export the matrix to a CSV file
-# Import json
-# def export_matrix_to_csv(domain, csv_filename):
-#     """
-#     Loads the specified MITRE ATT&CK matrix and exports all techniques to a CSV file.
-#     :param domain: The matrix domain, e.g. 'enterprise-attack', 'ics-attack', or 'mobile-attack'
-#     :param csv_filename: The output CSV file name
-#     """
-#     attack_store = get_attack_store(domain)
-#     patterns = attack_store.query([Filter("type", "=", "attack-pattern")])
-#     rows = []
-#     for obj in patterns:
-#         # Convert to dict for JSON serialization
-#         if hasattr(obj, 'serialize'):
-#             raw_dict = obj.serialize()
-#             if isinstance(raw_dict, str):
-#                 raw_dict = json.loads(raw_dict)
-#         elif hasattr(obj, 'to_dict'):
-#             raw_dict = obj.to_dict()
-#         else:
-#             raw_dict = dict(obj)
-#         rows.append({
-#             "id": raw_dict.get("id", ""),
-#             "name": raw_dict.get("name", ""),
-#             "raw": json.dumps(raw_dict)
-#         })
-
-#     df = pd.DataFrame(rows)
-#     df.to_csv(csv_filename, index=False, encoding="utf-8")
-#     print(f"Exported {len(df)} techniques to {csv_filename}")
-
-def find_matching_techniques(alert_title, data_block, attack_store, min_score=100):
+def find_matching_techniques(alert_title, data_block, min_score=100):
     """
-    Returns a list of MITRE techniques matching keywords in the alert title and data_block.
+    Returns a list of MITRE techniques matching keywords in the alert title and data_block
+    across all ATT&CK matrices.
     """
+    matrices = {
+        "enterprise-attack": "Enterprise",
+        "ics-attack": "ICS",
+        "mobile-attack": "Mobile",
+    }
+
     # 1. Gather keywords from alert_title and data_block
     keywords = set(re.findall(r'\w+', alert_title))
-    # If data_block is a dict (from CLI, parse if string)
     if isinstance(data_block, str):
         try:
             data_block = ast.literal_eval(data_block)
@@ -173,41 +161,49 @@ def find_matching_techniques(alert_title, data_block, attack_store, min_score=10
             keywords.update(re.findall(r'\w+', str(val)))
     keywords = {k.lower() for k in keywords if len(k) > 2}
 
-    # 2. Search techniques
-    results = []
-    for t in attack_store.query([Filter("type", "=", "attack-pattern")]):
-        fields = [
-            t.get("name", ""),
-            t.get("description", ""),
-            " ".join(t.get("x_mitre_detection", [])) if "x_mitre_detection" in t else "",
-        ]
-        all_text = " ".join(fields).lower()
-        matches = []
-        for kw in keywords:
-            score = fuzz.partial_ratio(kw, all_text)
-            if score >= min_score:
-                matches.append((kw, score))
-        if matches:
-            results.append({
-                "tech_id": next((r.get("external_id") for r in t.get("external_references", []) if "external_id" in r), None),
-                "name": t.get("name"),
-                "description": t.get("description", "")[:100] + "...",
-                "matched_keywords": matches,
-                "url": next((r.get("url") for r in t.get("external_references", []) if r.get("source_name") == "mitre-attack"), ""),
-            })
+    # 2. Search techniques in all matrices
+    all_results = []
+    for matrix_key, matrix_name in matrices.items():
+        attack_store = get_attack_store(matrix_key)
+        for t in attack_store.query([Filter("type", "=", "attack-pattern")]):
+            fields = [
+                t.get("name", ""),
+                t.get("description", ""),
+                " ".join(t.get("x_mitre_detection", [])) if "x_mitre_detection" in t else "",
+            ]
+            all_text = " ".join(fields).lower()
+            matches = []
+            for kw in keywords:
+                score = fuzz.partial_ratio(kw, all_text)
+                if score >= min_score:
+                    matches.append((kw, score))
+            if matches:
+                all_results.append({
+                    "matrix": matrix_name,
+                    "tech_id": next((r.get("external_id") for r in t.get("external_references", []) if "external_id" in r), None),
+                    "name": t.get("name"),
+                    "description": t.get("description", "")[:100] + "...",
+                    "matched_keywords": matches,
+                    "url": next((r.get("url") for r in t.get("external_references", []) if r.get("source_name") == "mitre-attack"), ""),
+                })
     # Sort by number of matches, then by name
-    results = sorted(results, key=lambda x: (-len(x["matched_keywords"]), x["name"]))
-    return results
+    all_results = sorted(all_results, key=lambda x: (-len(x["matched_keywords"]), x["name"]))
 
-def main(techniques):
-    """
-    CLI entry point. Pass a comma-separated list of technique IDs, e.g.:
-    python get_mitre_attack_details.py main --techniques=T1098,T1203
-    """
+    if not all_results:
+        print("No MITRE ATT&CK techniques matched this alert.")
+        html_table = "<h2>No matching MITRE ATT&CK techniques found</h2>"
+        return html_table
+
+    print(f"\nTop {min(10, len(all_results))} MITRE techniques for alert '{alert_title}':\n")
+    for r in all_results[:10]:
+        print(f"{r['tech_id']} | {r['name']} | {r['url']}")
+        print(f"  Desc: {r['description']}")
+        print(f"  Keywords matched: {r['matched_keywords']}\n")
     
-    if isinstance(techniques, str):
-        techniques = [t.strip() for t in techniques.split(",")]
-    mitre_attack_html_section(techniques)
+    # show as HTML section
+    html_table = mitre_attack_html_section([r['tech_id'] for r in all_results[:10] if r['tech_id']])
+    
+    return html_table
 
 def main(techniques=None, alert_title=None, data_block=None, min_score=70):
     """
@@ -223,19 +219,9 @@ def main(techniques=None, alert_title=None, data_block=None, min_score=70):
 
     # 1. If mapping by alert title/data_block
     if alert_title:
-        print("Loading MITRE ATT&CK enterprise-attack matrix...")
-        attack_store = get_attack_store("enterprise-attack")
-        results = find_matching_techniques(alert_title, data_block or {}, attack_store, min_score=int(min_score))
-        if not results:
-            print("No MITRE ATT&CK techniques matched this alert.")
-            return
-        print(f"\nTop {min(10, len(results))} MITRE techniques for alert '{alert_title}':\n")
-        for r in results[:10]:
-            print(f"{r['tech_id']} | {r['name']} | {r['url']}")
-            print(f"  Desc: {r['description']}")
-            print(f"  Keywords matched: {r['matched_keywords']}\n")
-        # Optional: show as HTML section
-        mitre_attack_html_section([r['tech_id'] for r in results[:10] if r['tech_id']])
+        print("Finding matching MITRE ATT&CK techniques for the alert...")
+        #attack_store = get_attack_store("enterprise-attack")
+        find_matching_techniques(alert_title, data_block or {}, min_score=int(min_score))
         return
 
     # 2. Original behavior: display known techniques
