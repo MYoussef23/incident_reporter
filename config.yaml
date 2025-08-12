@@ -1,3 +1,5 @@
+# --------------- Queries --------------- #
+
 incident_details_query: |
   SecurityIncident
     | where IncidentNumber == '{incident_no}'
@@ -29,18 +31,109 @@ get_alert_link_query: |
     | where SystemAlertId in('{alert_id}')
     | project AlertLink
 
-PROMPT_TEMPLATE_WITH_ALERT_DETAILS: |
-  Given the following security alert and context, determine the most relevant MITRE ATT&CK technique(s):
+IDENTITYINFO_KQL: |
+  let UserInput = "{AccountUPN}";
+  IdentityInfo
+  | extend UserPrincipalName = AccountUPN
+  | extend UserDisplayName = AccountDisplayName
+  | where UserPrincipalName contains UserInput
+  | summarize LatestTimeGenerated = max(TimeGenerated) by UserDisplayName, UserPrincipalName, IsAccountEnabled, MailAddress, Manager, Department, JobTitle, AccountCreationTime, SAMAccountName
+  | sort by LatestTimeGenerated 
 
-  Alert Title: {alert_title}
-  Detection Query: {detection_data}
+SIGNIN_INTERACTIVE_KQL: |
+  let UserPrincipalName_ = "{UserPrincipalName}";
+  SigninLogs
+  | where UserPrincipalName =~ UserPrincipalName_
+  | extend DeviceBrowser = tostring(DeviceDetail.browser)
+  | extend DeviceId = tostring(DeviceDetail.deviceId)
+  | extend DeviceDisplayName = parse_json(DeviceDetail).displayName
+  | extend DeviceOperatingSystem = parse_json(DeviceDetail).operatingSystem
+  | extend DeviceTrustType = tostring(DeviceDetail.trustType)
+  | extend DeviceIsManaged = tostring(DeviceDetail.isManaged)
+  | extend City = tostring(LocationDetails.city)
+  | extend CountryOrRegion = tostring(LocationDetails.countryOrRegion)
+  | extend State = tostring(LocationDetails.state)
+  | extend StatusAdditionalDetails = tostring(Status.additionalDetails)
+  | extend StatusFailureReason = tostring(Status.failureReason)
+  | project TimeGenerated,ResultType,StatusFailureReason,DeviceDisplayName,DeviceOperatingSystem,DeviceBrowser,Location,City,State,AppDisplayName,IPAddress
+  | sort by TimeGenerated desc
 
-  Respond as a list of technique ID's. Only show relevant technique(s) and only output the technique number(s) (no extra text or explanations).
+SIGNIN_NONINTERACTIVE_KQL: |
+  let UserPrincipalName_ = "{UserPrincipalName}";
+  AADNonInteractiveUserSignInLogs
+  | where UserPrincipalName =~ UserPrincipalName_
+  | extend DeviceBrowser = parse_json(DeviceDetail).browser
+  | extend DeviceDisplayName = parse_json(DeviceDetail).displayName
+  | extend DeviceOperatingSystem = parse_json(DeviceDetail).operatingSystem
+  | extend City = parse_json(LocationDetails).city
+  | extend CountryOrRegion = parse_json(LocationDetails).countryOrRegion
+  | extend State = parse_json(LocationDetails).state
+  | extend StatusAdditionalDetails = parse_json(Status).additionalDetails
+  | extend StatusFailureReason = parse_json(Status).failureReason
+  | project TimeGenerated,ResultType,StatusFailureReason,DeviceDisplayName,DeviceOperatingSystem,DeviceBrowser,Location,City,State,AppDisplayName,IPAddress
+  | sort by TimeGenerated desc
 
-PROMPT_TEMPLATE_WITH_DETECTION_DATA: |
-  Given the following security alert and context, determine the most relevant MITRE ATT&CK technique(s):
+OFFICE_ACTIVITY_KQL: |
+  let UPN = "{UserPrincipalName}";
+  let Operation_ = "{Operation}";
+  OfficeActivity
+  | where UserId =~ UPN
+  | where array_length(Ops) == 0 or Operation in (Ops)
+  | project TimeGenerated, UserAgent, Operation, OfficeWorkload, ClientIP, Site_Url, SourceRelativeUrl, SourceFileName
+  | sort by TimeGenerated desc
 
-  Alert Title: {alert_title}
-  Detection Data: {detection_data}
+# --------------- LLM Prompts --------------- #
 
-  Respond as a list of technique ID's. Only show relevant technique(s) and only output the technique number(s) (no extra text or explanations).
+PROMPT_TEMPLATE_FOR_MITRE_ATTACK_TECHNIQUES: |
+  IMPORTANT - OUTPUT FORMAT REQUIREMENTS:
+  You MUST respond ONLY with a valid Python list of tuples, in this exact form:
+  [('T####', 'short explanation'), ('T####', 'short explanation'), ...]
+
+  Rules:
+  - Each tuple = (TechniqueID, Short explanation).
+  - TechniqueID must be a valid MITRE ATT&CK ID (e.g., "T1046").
+  - The Short explanation must be concise and tailored to the alert context.
+  - DO NOT include MITRE technique names.
+  - DO NOT include any commentary, reasoning, or extra text outside the list.
+  - DO NOT add headers, markdown, or explanations - ONLY the list.
+
+  ---
+
+  Given the following security alert details, determine the most relevant MITRE ATT&CK techniques based on the activity described.
+
+  Alert Title:
+  {alert_title}
+
+  Detection Data/Query:
+  {detection_data}
+
+  Now return ONLY the list of tuples as specified above.
+
+PROMPT_TEMPLATE_FOR_MISSING_TECHNIQUE_DESCRIPTION: |
+  IMPORTANT - OUTPUT FORMAT REQUIREMENTS:
+  You MUST respond ONLY with a valid Python list of tuples, in this exact form:
+  [('T####', 'short explanation'), ('T####', 'short explanation'), ...]
+
+  Rules:
+  1. Each tuple = (Technique ID, Short Description).
+  2. If the Short Description is missing, empty, or whitespace-only:
+      - Replace it with a concise, alert-specific explanation of why that technique is relevant, based on the alert title and detection data.
+  3. If a description already exists, LEAVE IT UNCHANGED.
+  4. If context is insufficient, use exactly: "Relevant to alert behaviour based on alert context."
+  5. The output MUST be valid Python that can be parsed by ast.literal_eval().
+  6. DO NOT return empty strings for descriptions.
+  7. DO NOT include any commentary, reasoning, headers, or extra text - ONLY the Python list.
+
+  ---
+
+  Alert Title:
+  {alert_title}
+
+  Detection Data:
+  {detection_data}
+
+  Techniques List:
+  {techniques_list}
+
+  Now return ONLY the updated Python list of tuples as specified above.
+
