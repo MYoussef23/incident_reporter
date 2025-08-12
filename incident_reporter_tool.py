@@ -5,7 +5,7 @@
 
 # Imports for the Azure/OSINT check functions
 import os
-import sys
+import time
 from html import escape
 import json
 import yaml
@@ -16,10 +16,12 @@ import azure_monitor_logs_run_query
 import iocextract
 import osint_scanner
 import get_mitre_attack_details
-import mitre_ollama_prompt
+import ollama_prompt
+import investigation_query_pack
+import beep
+from pathlib import Path
 import webbrowser 
 import nest_asyncio
-import subprocess
 import warnings
 from urllib3.exceptions import InsecureRequestWarning
 from tkinter import Tk, filedialog
@@ -52,6 +54,7 @@ def close_excel_with_file_open(filename):
 def get_valid_incident_id():
     while True:
         incident_id = get_incident_number()
+        beep.beep()     # Play a notification sound for user attention
         user_continue = input(f"\nYou have selected Incident ID: {incident_id}. Do you want to continue? (Y/N): ").strip().lower()
         if user_continue in ['y', 'yes']:
             return incident_id  # Proceed with this incident ID
@@ -59,19 +62,24 @@ def get_valid_incident_id():
             print("Let's enter a different Incident ID.")
             continue
         else:
+            beep.beep()     # Play a notification sound for user attention
             print("Invalid input. Please enter 'Y' to continue or 'N' to re-enter the Incident ID.")
 
 def get_incident_number():      # This will loop till the user enters a valid entry which is a positive integer (Sentinel works off positive integer incident number types)
     while True:
+            beep.beep()     # Play a notification sound for user attention
             incident_id = input("Enter the Incident ID: ").strip()
             try:
-                incident_id = int(incident_id)
-                if incident_id > 0:
-                    return incident_id
+                if incident_id.isdigit():
+                    incident_id = int(incident_id)
+                    if incident_id > 0:
+                        return incident_id
                 else:
-                    print("Incident ID must be a positive integer.")
+                    beep.beep()     # Play a notification sound for user attention
+                    print("❌ Invalid input. Please enter a valid incident number, which for Sentinel is a numeric value.")
             except ValueError:
-                print("Please enter a valid numeric Incident ID.")
+                beep.beep()     # Play a notification sound for user attention
+                print("❌ Invalid input. Please enter a valid incident number, which for Sentinel is a numeric value.")
 
 def save_to_csv(table, filename_csv, filename_json):
     # put table data in dataframe
@@ -199,6 +207,7 @@ def OSINT_check(query_result):
     VT_api_key = config["VT_api_key"]
     ABDB_api_key = config["ABDB_api_key"]
 
+    print("🔍 Beginning IOC extraction from data...")
     iocs = extract_iocs_in_data(query_result)
     
     # set the entity lists
@@ -343,13 +352,28 @@ def run_detection_queries_on_alerts(alerts, workspace_id, alert_link_query):  # 
             print(f"Opening query result file: {csv_filename}...")
             os.startfile(csv_filename)
 
+            # Get number of rows in the query_table
+            row_count = len(query_table["rows"])
+
             # Normalise query_result into HTML format
             columns = [col["name"] for col in query_table["columns"]]
-            rows = query_table["rows"]
-            query_result = "<br />".join(
-                [",".join(columns)] +
-                [",".join(str(cell) for cell in row) for row in rows]
-            )
+
+            if row_count < 100:     # If row count is less that 100, then normalise data in HTML format
+                rows = query_table["rows"]
+                note_html = ""
+                query_result = note_html + "<br />".join(
+                        [",".join(columns)] +
+                        [",".join(str(cell) for cell in row) for row in rows]
+                    )
+            else:   # Provide a CSV download link if more than 100 rows
+                print(f"⚠ Events exceed 100 rows ({row_count} rows). Displaying first 100 rows only in HTML output...")
+                rows = query_table["rows"][:100]
+                note_html = f"<p><strong>Showing first 100 of {row_count} events</strong></p>\n"
+                query_result = note_html + "<pre>" + "<br />".join(
+                        [",".join(columns)] +
+                        [",".join(str(cell) for cell in row) for row in rows]
+                    ) + "</pre>"
+            
             all_query_results.append(query_result)
 
         else:   # Get the alert link
@@ -369,6 +393,133 @@ def run_detection_queries_on_alerts(alerts, workspace_id, alert_link_query):  # 
                 all_query_results.append(f"<p>No alert link found for this alert in {product_name}</p>")
     
     return alerts[0]["IncidentTitle"], all_query_results, tactics, techniques, product_name, detection_query
+
+def prompt_for_mitre_attack_techniques(prompt, techniques):
+    # --- Show the prompt being sent ---
+    print("\n====================")
+    print("📤 Prompt sent to Ollama:")
+    print("====================")
+    print(prompt)
+    print("====================\n")
+
+    # Prompt the LLM to find techniques related to the alert
+    mitre_output = ollama_prompt.run_ollama(prompt)
+
+    # --- Show raw output from Ollama ---
+    print("\n====================")
+    print("📥 Raw output from Ollama:")
+    print("====================")
+    print(mitre_output)
+    print("====================\n")
+
+    # Extract techniques from LLM output
+    techniques_llm = extract_techniques(mitre_output)
+    # --- Show parsed techniques ---
+    print("\n====================")
+    print("✅ Parsed MITRE ATT&CK Techniques")
+    print("====================")
+    # Inspect what you actually have
+    print(f"type={type(techniques_llm)} len={len(techniques_llm)}")
+    print(techniques_llm)
+    print("====================\n")
+
+    techniques = normalize_techniques(techniques_llm, techniques)
+
+    return techniques
+
+def extract_techniques(text: str):
+    """
+    Extract a list of (TechniqueID, Description) tuples from LLM output.
+    - Parses the first Python list of tuples found (even if wrapped in prose or code fences).
+    - Falls back to parsing 'Txxxx | desc' or 'Txxxx' lines.
+    """
+    if not isinstance(text, str):
+        return []
+
+    s = text.strip()
+
+    # 1) Strip code fences if present
+    fence = re.compile(r"^```(?:python|py)?\s*([\s\S]*?)\s*```$", re.IGNORECASE)
+    m = fence.search(s)
+    if m:
+        s = m.group(1).strip()
+
+    # 2) Find the first bracketed list and try to parse it
+    #    (works even when prose surrounds the list)
+    list_match = re.search(r"\[[\s\S]*?\]", s)      # non-greedy
+    if list_match:
+        snippet = list_match.group(0)
+        try:
+            parsed = ast.literal_eval(snippet)
+            if isinstance(parsed, list) and all(isinstance(t, tuple) and len(t) == 2 for t in parsed):
+                return [(str(t[0]).strip(), str(t[1]).strip()) for t in parsed]
+        except Exception:
+            pass  # fall through to line-based parsing
+
+    # 3) Fallback: parse line-based outputs like "T1046 | desc" or just "T1046"
+    out = []
+    for ln in [ln.strip() for ln in s.splitlines() if ln.strip()]:
+        # Accept if the line contains a Technique ID anywhere
+        m = re.search(r"\b(T\d{4,5})\b", ln)
+        if not m:
+            continue
+        tid = m.group(1)
+        if "|" in ln:
+            _, desc = ln.split("|", 1)
+            out.append((tid, desc.strip()))
+        else:
+            out.append((tid, ""))
+    return out
+
+def normalize_techniques(techniques_llm, techniques):
+    """
+    Normalize MITRE ATT&CK techniques from an LLM output into a list of (id, desc) tuples.
+    Supports input as string, list of strings, or list of tuples.
+    
+    Args:
+        techniques_llm (str | list): Raw techniques data from LLM.
+        techniques (list): Existing list of techniques to extend.
+    
+    Returns:
+        list: Normalized list of (id, desc) tuples.
+    """
+    if isinstance(techniques_llm, str):
+        # Split string into tuples (id, desc)
+        techniques_llm = [
+            tuple(map(str.strip, entry.split("|", 1)))
+            for entry in re.split(r'[\n]+', techniques_llm)
+            if entry.strip()
+        ]
+
+    elif isinstance(techniques_llm, list):
+        flat_techniques_llm = []
+        for t in techniques_llm:
+            if isinstance(t, tuple):
+                # Already in (id, desc) form
+                flat_techniques_llm.append((t[0].strip(), t[1].strip() if len(t) > 1 else ""))
+            elif isinstance(t, str):
+                # Split string into entries
+                for entry in re.split(r'[\n]+', t):
+                    if entry.strip():
+                        parts = entry.split("|", 1)
+                        flat_techniques_llm.append(
+                            (parts[0].strip(), parts[1].strip() if len(parts) > 1 else "")
+                        )
+        techniques_llm = flat_techniques_llm
+
+    # Extend techniques with new data
+    if techniques_llm:
+        techniques.extend(techniques_llm)
+
+    # Ensure consistent (id, desc) format
+    techniques = [
+        (t[0], t[1] if len(t) == 2 and t[1].strip() else "")
+        if isinstance(t, tuple) else (t, "")
+        for t in techniques
+    ]
+
+    # Deduplicate by first element of tuple (technique ID), keeping the last occurrence
+    return list({t[0]: t for t in techniques}.values())
 
 # ------------ HTML Output Functions ------------ #
 def generate_html_report(Incident_no, Incident_title, query_result, ABIPDB_analysis, skipped_ip_analysis, domain_analysis, file_hash_analysis, mitre_attack_map):
@@ -409,6 +560,7 @@ def generate_html_report(Incident_no, Incident_title, query_result, ABIPDB_analy
 # ------------ Run Script ------------ #
 def main_menu():
     while True:
+        beep.beep()     # Play a notification sound for user attention
         print("\nMain Menu:")
         print("1. Use Azure Monitor Logs to obtain the detection query results")
         print("2. Use a CSV file containing the query results or enter event details manually (you will be prompted if you wish to select a CSV file or enter the event details manually using text input)")
@@ -417,9 +569,11 @@ def main_menu():
         
         if choice == '1':
             # Handle Azure Monitor Logs
+            beep.beep()     # Play a notification sound for user attention
             user_selection = input("You have selected to use Azure Monitor Logs. Do you wish to continue? (Y/N)\n " \
                                     "Enter 'Y' to continue or 'N' to return to the main menu: ").strip().lower()
             while user_selection not in ['yes', 'y', 'no', 'n']:
+                beep.beep()     # Play a notification sound for user attention
                 user_selection = input("Invalid selection. Please enter 'yes' or 'no': ").strip().lower()
             if user_selection in ['no', 'n']:
                 print("Returning to the main menu...")
@@ -428,9 +582,11 @@ def main_menu():
                 return '1'  # Return to indicate Azure Monitor Logs selection
         elif choice == '2':
             # Handle CSV file input
+            beep.beep()     # Play a notification sound for user attention
             user_selection = input("You have selected to use a CSV file containing the query results. Do you wish to continue? (Y/N)\n " \
                                     "Enter 'Y' to continue or 'N' to return to the main menu: ").strip().lower()
             while user_selection not in ['yes', 'y', 'no', 'n']:
+                beep.beep()     # Play a notification sound for user attention
                 user_selection = input("Invalid selection. Please enter 'Y' or 'N': ").strip().lower()
             if user_selection in ['no', 'n']:
                 print("Returning to the main menu...")
@@ -443,8 +599,20 @@ def main_menu():
         else:
             print("Invalid selection. Please try again.")
 
+def format_elapsed(seconds: float) -> str:
+    """Format elapsed time as M min S sec."""
+    minutes = int(seconds // 60)
+    sec = seconds % 60
+    if minutes > 0:
+        return f"{minutes}m {sec:.2f}s"
+    else:
+        return f"{sec:.2f}s"
+
 if __name__ == '__main__':
     try:
+
+        start_time = time.perf_counter()  # start timer
+
         osint_checks = False # Flag to indicate if OSINT checks are performed
 
         # Allow the user to login to Azure and add the workspaces to a variable for user selection
@@ -456,9 +624,13 @@ if __name__ == '__main__':
 
         if user_selection == '1':
             # This selection will run the azure_monitor_logs_query_tool CLI to login to Azure and grab the detection query results
+
+            # ---------------- Azure Monitor Logs Selection ------------ #
+
                 # Close any instances of the query_table.csv file before proceeding
             close_excel_with_file_open("query_table")
                 # Start the login process into Azure using the azure_monitor_login CLI
+            
             print("\nYou have selected to use Azure Monitor Logs. Please ensure you have the necessary permissions to access the logs (recommended minimum: Log Analytics Reader role on the workspace).")
                 # Run the azure_monitor_login CLI to login to Azure to get the workspace ID
             workspace_id = azure_monitor_get_workspace.azure_monitor_login()
@@ -485,12 +657,13 @@ if __name__ == '__main__':
             
             query = config['get_alert_link_query'].format(alert_id=alert_id)
             incident_title, query_result, tactics, techniques, product_name, detection_query = run_detection_queries_on_alerts(alerts, workspace_id, query)  # Run detection queries on the alerts
+
             if product_name.lower().endswith("sentinel"):
                 osint_checks = True # Set the flag to indicate OSINT checks will be performed on those alerts where the alert is from Sentinel
             else:
                 osint_checks = False  # Set the flag to indicate OSINT checks will not be performed on those alerts where the alert is not from Sentinel
-            
-            #print(f"Techniques being passed: {techniques} (type: {type(techniques)})")
+
+            # ---------------- LLM MITRE ATT&CK Mapping and HTML Output ------------ #
 
             #  make sure techniques is a list
             if isinstance(techniques, str):
@@ -500,38 +673,47 @@ if __name__ == '__main__':
                 except Exception:
                     techniques = [t.strip() for t in techniques.split(",") if t.strip()]
             
-            # # Try to find other techniques related to the alert using LLM prompt
-            print(f"\nAttempting to find additional MITRE ATT&CK techniques related to the alert: {incident_title}")
-            config = load_config('config.json')  # Load the configuration file to get the OpenAI API key
-            openai_api_key = config['OpenAI_api_key']
-            # Prompt the public LLM to find MITRE ATT&CK techniques related to the incident as no senstive data is being passed
-            techniques_llm = mitre_ollama_prompt.mitre_mapper(incident_title, detection_query, provider="openai", openai_api_key=openai_api_key)       # Uncomment this line to use OpenAI API
-            #techniques_llm = mitre_ollama_prompt.mitre_mapper(incident_title, detection_query, provider="ollama")       # Uncomment this line to use Ollama API
-            # Print the techniques_llm to see what it returns
-            print(f"Techniques from LLM: {techniques_llm} (type: {type(techniques_llm)})")
-            # make techniques_llm a list if it is a string
-            if isinstance(techniques_llm, str):
-                techniques_llm = [t.strip() for t in techniques_llm.split(",") if t.strip()]
-            elif isinstance(techniques_llm, list):
-                # Flatten any comma-separated strings in the list
-                flat_techniques_llm = []
-                for t in techniques_llm:
-                    flat_techniques_llm.extend([x.strip() for x in t.split(",") if x.strip()])
-                techniques_llm = flat_techniques_llm
-            # add the techniques_llm to the techniques list
-            if techniques_llm:
-                techniques.extend(techniques_llm)
-            # Remove duplicates from techniques
-            techniques = list(set(techniques))
+            # Try to find other techniques related to the alert using LLM prompt
+            print(f"\nAttempting to find additional MITRE ATT&CK techniques related to the alert: {incident_title}, using a local LLaMA3 LLM. This may take a minute on first run while the model loads...")
+            # Get the prompt template and format it with the detection query and incident title
+            prompt = config['PROMPT_TEMPLATE_FOR_MITRE_ATTACK_TECHNIQUES'].format(
+                detection_data=detection_query, alert_title=incident_title
+            )
+
+            techniques = prompt_for_mitre_attack_techniques(prompt, techniques)
+
+            # Keep checking for missing technique descriptions until all are filled
+            while True:
+                # Then check for empty (or "") second values in the techniques tuple
+                if any(t[1] == "" for t in techniques):     # If any technique description is empty, prompt the LLM to get the descriptions
+                    print("\nTechniques listed in the alert do not have descriptions. Attempting to get descriptions for these techniques...")
+                    # Get the prompt template and format it with the techniques tuple, detection query, and incident title
+                    prompt = config['PROMPT_TEMPLATE_FOR_MISSING_TECHNIQUE_DESCRIPTION'].format(
+                        techniques_list=techniques, detection_data=detection_query, alert_title=incident_title
+                    )
+
+                    techniques = prompt_for_mitre_attack_techniques(prompt, techniques)
+                else:
+                    # All descriptions are filled — exit loop
+                    break
 
             # Complete the MITRE ATT&CK mapping and HTML output
             print(f"\nPerforming MITRE ATT&CK mapping for techniques: {techniques}")
             mitre_attack_map = get_mitre_attack_details.mitre_attack_html_section(techniques)
-            #mitre_attack_map = ""
+            
+            # ---------------- Investigation Query Pack ------------ #
+
+            print("\nQuerying relevent logs for investigation notes...")
+            # Extract entities from the alert
+            entities = investigation_query_pack.extract_entities(incident_title, query_result)
+            #print(entities)
+
 
         elif user_selection == '2':
+            beep.beep()     # Play a notification sound for user attention
             csv_data_or_text = input("Do you wish to select a CSV file containing the query results or paste the incident details as text? (Enter 'csv' for file or 'text' for text): ").strip().lower()
             while csv_data_or_text not in ['csv', 'text']:
+                beep.beep()     # Play a notification sound for user attention
                 csv_data_or_text = input("Invalid selection. Please enter 'csv' for file or 'text' for text: ").strip().lower()
             if csv_data_or_text == 'csv':
                 # Close any instances of the query_table.csv file before proceeding
@@ -555,17 +737,16 @@ if __name__ == '__main__':
                 print("No query results found. Please ensure that the CSV file is in the correct format and contains the necessary data.")
                 exit(1)
 
-            # print("Please ensure that the CSV file is in the correct format and contains the necessary data.")
-            # query_result, query_result_json = get_query_results_from_file()  # Get the query results from the CSV file
+            beep.beep()     # Play a notification sound for user attention
             print("Please enter the incident number and title for the report.")
             incident_no = input("Incident Number: ").strip()
+            beep.beep()     # Play a notification sound for user attention
             incident_title = input("Incident Title: ").strip()
             osint_checks = True  # Set the flag to indicate OSINT checks will be performed
-            #mitre_attack_map = ""
             
             # Prompt for MITRE ATT&CK techniques
             print(f"\nAttempting to find MITRE ATT&CK techniques related to the incident: {incident_title}")
-            techniques = mitre_ollama_prompt.mitre_mapper(incident_title, query_result_json, provider="ollama")  # Use OpenAI API to find techniques
+            techniques = ollama_prompt.mitre_mapper(incident_title, query_result_json, provider="ollama")  # Use OpenAI API to find techniques
             if isinstance(techniques, str):
                 techniques = [t.strip() for t in techniques.split(",") if t.strip()]
             elif isinstance(techniques, list):
@@ -578,17 +759,35 @@ if __name__ == '__main__':
             #mitre_attack_map = get_mitre_attack_details.find_matching_techniques(incident_title, query_result)
             mitre_attack_map = get_mitre_attack_details.mitre_attack_html_section(techniques)
 
-            print(query_result)
-
         elif user_selection == '3':
             print("Exiting the tool. Goodbye!")
             exit(0)
         
         if osint_checks:        # Perform OSINT checks if the flag is set
-            # Apply nest_asyncio to allow nested event loops
-            nest_asyncio.apply()
-            #ABIPDB_analysis, skipped_ip_analysis, domain_analysis, hash_analysis = asyncio.run(OSINT_check(query_result))  # Perform the OSINT checks
-            ABIPDB_analysis, skipped_ip_analysis, domain_analysis, hash_analysis = OSINT_check(query_result)  # Perform the OSINT checks
+            # Prompt user for OSINT check confirmation with validation
+            while True:
+                beep.beep()     # Play a notification sound for user attention
+                user_choice = input(
+                    "📄 Please review the alert data in the generated Excel/CSV file first.\n"
+                    "Would you like to perform OSINT checks on the indicators in this data? (y/n): "
+                ).strip().lower()
+                if user_choice in ("y", "n"):
+                    break
+                else:
+                    beep.beep()     # Play a notification sound for user attention
+                    print("❌ Invalid input. Please enter 'y' for yes or 'n' for no.")
+            if user_choice == "y":
+                print("[INFO] Starting OSINT checks...")
+                # Apply nest_asyncio to allow nested event loops
+                nest_asyncio.apply()
+                ABIPDB_analysis, skipped_ip_analysis, domain_analysis, hash_analysis = OSINT_check(query_result)  # Perform the OSINT checks
+            else:
+                print("[INFO] Skipping OSINT checks.")
+                # If OSINT checks are not performed, set the analysis variables to empty strings
+                ABIPDB_analysis = ""
+                skipped_ip_analysis = ""
+                domain_analysis = ""
+                hash_analysis = ""
         else:       # If OSINT checks are not performed, set the analysis variables to empty strings
             ABIPDB_analysis = ""
             skipped_ip_analysis = ""
@@ -597,12 +796,17 @@ if __name__ == '__main__':
 
         # Build the HTML content
             # Create an HTML file with the content and save it
-        with open("sample.html", "w", encoding="utf-8") as file:
+        with open("report.html", "w", encoding="utf-8") as file:
             file.write(generate_html_report(incident_no, incident_title, query_result, ABIPDB_analysis, skipped_ip_analysis, domain_analysis, hash_analysis, mitre_attack_map))
-        print("\nHTML file 'sample.html' created successfully.")
+        print("\nHTML file 'report.html' created successfully.")
 
         # open the HTML file in notepad
-        webbrowser.open("sample.html")
+        webbrowser.open("report.html")
+        end_time = time.perf_counter()  # end timer
+        elapsed = end_time - start_time
+        beep.beep()     # Play a notification sound for user attention
+        print(f"⏱ Execution time: {format_elapsed(elapsed)}\n")
 
     except Exception as e:
+        beep.beep()     # Play a notification sound for user attention
         print(f"Execution error: {e}")
