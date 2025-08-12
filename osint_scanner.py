@@ -9,6 +9,7 @@ from ipwhois import IPWhois
 from collections import defaultdict
 import argparse
 import sys
+import beep
 
 ### This module is inspired from script, OSINT_Scanner, created by Jade Hill (GitHub repo: https://github.com/jade-hill-sage/OSINT-Scanner) for performing OSINT checks in AbuseIPDB and VirusTotal.    
 
@@ -55,7 +56,7 @@ def validate_domain(domain, org_domains=None, org_cidrs=None):
     if org_domains:
         d = domain.lower()
         for od in org_domains:
-            if d == od.lower() or d.endswith("." + od.lower()):
+            if d == od.lower() or d.endswith("." + od.lower()) or od.lower().endswith("." + d):
                 return False
     
     # DNS resolution
@@ -155,6 +156,7 @@ def loop_file_hash_vt_check(api_key, file_hashes, header=None):
 
 def get_org_domains():
     domains = []
+    beep.beep()     # Play a notification sound for user attention
     print("Enter your organisation's corporate domain(s) (e.g., company.com). Any domains you list here will be excluded from OSINT checks to avoid unnecessary analysis your own corporate domains.")
     print("Enter one per line. Press Enter on a blank line to finish:")
     while True:
@@ -180,12 +182,12 @@ async def fetch_domain_info(api_key, domain):
 
 def loop_domain_vt_check(api_key, domains, header=None, org_cidrs=None):
     if org_cidrs is None:
-        org_domins = get_org_domains()      # Get the org corp domain to exclude in domain abuse analysis
+        org_domains = get_org_domains()      # Get the org corp domain to exclude in domain abuse analysis
     else:
-        org_domins = None
+        org_domains = None
     rows = []
     for domain in domains:
-        is_not_org_domain=validate_domain(domain, org_domins, org_cidrs)    # Check if the domain is not an org domain
+        is_not_org_domain=validate_domain(domain, org_domains, org_cidrs)    # Check if the domain is not an org domain
         if is_not_org_domain:   # Complete domain abuse check if domain is not the org domain
             print(f"Checking Domain: {domain}")
             outcome = asyncio.run(fetch_domain_info(api_key, domain))
@@ -225,6 +227,7 @@ def get_inetnum(ip):
 
 def get_org_cidrs(): # The user will be able to input their orgs public network range to avoid unnecessary OSINT checks.
     cidrs = []
+    beep.beep()     # Play a notification sound for user attention
     print("Enter your organisation's public network range(s) in CIDR notation (e.g., 203.0.113.0/24). To avoid unnecessary OSINT checks on your own IPs, any addresses within these ranges will be skipped.")
     print("Enter one per line. Press Enter on a blank line to finish:")
     while True:
