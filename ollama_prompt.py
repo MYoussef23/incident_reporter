@@ -54,7 +54,7 @@ def run_ollama(prompt: str, ollama_model: str = "llama3", max_retries: int = 3) 
                 choice = input().strip().lower()
                 if choice == "s":
                     print("[INFO] Skipping LLM call at user request.")
-                    return ""
+                    return "s"
                 # user pressed Enter → retry same attempt number incremented below
             else:
                 # Non-memory error: brief delay then retry
