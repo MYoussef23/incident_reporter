@@ -392,40 +392,72 @@ def run_detection_queries_on_alerts(alerts, workspace_id, alert_link_query):  # 
                 print(f"No alert link found for Alert {idx} ({product_name}): {incident_title} ({alert_id})")
                 all_query_results.append(f"<p>No alert link found for this alert in {product_name}</p>")
     
-    return alerts[0]["IncidentTitle"], all_query_results, tactics, techniques, product_name, detection_query
+    return alerts[0]["IncidentTitle"], all_query_results, tactics, techniques, product_name, detection_query, json_filename
 
-def prompt_for_mitre_attack_techniques(prompt, techniques):
-    # --- Show the prompt being sent ---
-    print("\n====================")
-    print("📤 Prompt sent to Ollama:")
-    print("====================")
-    print(prompt)
-    print("====================\n")
+def prompt_for_mitre_attack_techniques(prompt, incident_title, techniques=None):
+    # Ask the user if they wish to proceed
+    user_choice = input("⚠️ Do you want to perform MITRE ATT&CK mapping for this alert? (y/n): ").strip().lower()
 
-    # Prompt the LLM to find techniques related to the alert
-    mitre_output = ollama_prompt.run_ollama(prompt)
+    # Keep asking until valid input is given
+    while True:
+        if user_choice in ("y", "yes"):
+            #  make sure techniques is a list
+            if isinstance(techniques, str):
+                # If techniques is a string representation of a list, use ast.literal_eval
+                try:
+                    techniques = ast.literal_eval(techniques)
+                except Exception:
+                    techniques = [t.strip() for t in techniques.split(",") if t.strip()]
+            
+            # Try to find techniques related to the alert using LLM prompt
+            print(f"\nAttempting to find MITRE ATT&CK techniques related to the alert: {incident_title}, using a local LLaMA3 LLM. This may take a minute on first run while the model loads...")
+            # --- Show the prompt being sent ---
+            print("\n====================")
+            print("📤 Prompt sent to Ollama:")
+            print("====================")
+            print(prompt)
+            print("====================\n")
 
-    # --- Show raw output from Ollama ---
-    print("\n====================")
-    print("📥 Raw output from Ollama:")
-    print("====================")
-    print(mitre_output)
-    print("====================\n")
+            # Prompt the LLM to find techniques related to the alert
+            mitre_output = ollama_prompt.run_ollama(prompt)
+            if mitre_output == "s":
+                mitre_attack_map = ""
+                break
 
-    # Extract techniques from LLM output
-    techniques_llm = extract_techniques(mitre_output)
-    # --- Show parsed techniques ---
-    print("\n====================")
-    print("✅ Parsed MITRE ATT&CK Techniques")
-    print("====================")
-    # Inspect what you actually have
-    print(f"type={type(techniques_llm)} len={len(techniques_llm)}")
-    print(techniques_llm)
-    print("====================\n")
+            # --- Show raw output from Ollama ---
+            print("\n====================")
+            print("📥 Raw output from Ollama:")
+            print("====================")
+            print(mitre_output)
+            print("====================\n")
 
-    techniques = normalize_techniques(techniques_llm, techniques)
+            # Extract techniques from LLM output
+            techniques_llm = extract_techniques(mitre_output)
+            # --- Show parsed techniques ---
+            print("\n====================")
+            print("✅ Parsed MITRE ATT&CK Techniques")
+            print("====================")
+            # Inspect what you actually have
+            print(f"type={type(techniques_llm)} len={len(techniques_llm)}")
+            print(techniques_llm)
+            print("====================\n")
 
-    return techniques
+            techniques = normalize_techniques(techniques_llm, techniques)
+
+            # Complete the MITRE ATT&CK mapping and HTML output
+            print(f"\nPerforming MITRE ATT&CK mapping for techniques: {techniques}")
+            mitre_attack_map = get_mitre_attack_details.mitre_attack_html_section(techniques)
+        
+        elif user_choice in ("n", "no"):
+            print("❌ MITRE ATT&CK mapping skipped by user choice.")
+            mitre_attack_map = ""
+            break
+
+        else:
+            print("❌ Invalid input. Please enter 'y' or 'n'.")
+
+    #return techniques
+    return mitre_attack_map
 
 def extract_techniques(text: str):
     """
@@ -508,8 +540,11 @@ def normalize_techniques(techniques_llm, techniques):
         techniques_llm = flat_techniques_llm
 
     # Extend techniques with new data
-    if techniques_llm:
-        techniques.extend(techniques_llm)
+    if techniques:
+        if techniques_llm:
+            techniques.extend(techniques_llm)
+    else:
+        techniques = techniques_llm
 
     # Ensure consistent (id, desc) format
     techniques = [
@@ -615,6 +650,9 @@ if __name__ == '__main__':
 
         osint_checks = False # Flag to indicate if OSINT checks are performed
 
+        # Load the configuration file to get the queries for incident details
+        config = load_config('config.yaml')  # Load the configuration file
+
         # Allow the user to login to Azure and add the workspaces to a variable for user selection
         print("\nWelcome to the Alert Documentation Tool!")
         print("This tool will help you generate an HTML report based on the detection query results.")
@@ -640,8 +678,6 @@ if __name__ == '__main__':
                 
                 # Get the detection details including start time, end time, and query
             print(f"\nRetrieving detection details for incident ID: {incident_no} in workspace ID: {workspace_id}")
-                # Load the configuration file to get the queries for incident details
-            config = load_config('config.yaml')  # Load the configuration file
 
             query = config['incident_details_query'].format(incident_no=incident_no)
             result = azure_monitor_logs_run_query.run_query(workspace_id, query, timespan="P1D")  # Run the query to get the incident details
@@ -656,7 +692,7 @@ if __name__ == '__main__':
             alerts, alert_id = prepare_results(result)  # Ensure result is in the expected format
             
             query = config['get_alert_link_query'].format(alert_id=alert_id)
-            incident_title, query_result, tactics, techniques, product_name, detection_query = run_detection_queries_on_alerts(alerts, workspace_id, query)  # Run detection queries on the alerts
+            incident_title, query_result, tactics, techniques, product_name, detection_query, query_result_json = run_detection_queries_on_alerts(alerts, workspace_id, query)  # Run detection queries on the alerts
 
             if product_name.lower().endswith("sentinel"):
                 osint_checks = True # Set the flag to indicate OSINT checks will be performed on those alerts where the alert is from Sentinel
@@ -665,49 +701,21 @@ if __name__ == '__main__':
 
             # ---------------- LLM MITRE ATT&CK Mapping and HTML Output ------------ #
 
-            #  make sure techniques is a list
-            if isinstance(techniques, str):
-                # If techniques is a string representation of a list, use ast.literal_eval
-                try:
-                    techniques = ast.literal_eval(techniques)
-                except Exception:
-                    techniques = [t.strip() for t in techniques.split(",") if t.strip()]
-            
-            # Try to find other techniques related to the alert using LLM prompt
-            print(f"\nAttempting to find additional MITRE ATT&CK techniques related to the alert: {incident_title}, using a local LLaMA3 LLM. This may take a minute on first run while the model loads...")
+            # Read the events JSON file for the LLM prompt
+            with open(query_result_json, "r", encoding="utf-8") as f:
+                query_result_json = json.load(f)
             # Get the prompt template and format it with the detection query and incident title
             prompt = config['PROMPT_TEMPLATE_FOR_MITRE_ATTACK_TECHNIQUES'].format(
-                detection_data=detection_query, alert_title=incident_title
+                events_query=f"KQL:\n{detection_query}\n\nEvents:\n{query_result_json}", alert_title=incident_title
             )
+            #mitre_attack_map = prompt_for_mitre_attack_techniques(prompt, incident_title=incident_title)
 
-            techniques = prompt_for_mitre_attack_techniques(prompt, techniques)
-
-            # Keep checking for missing technique descriptions until all are filled
-            while True:
-                # Then check for empty (or "") second values in the techniques tuple
-                if any(t[1] == "" for t in techniques):     # If any technique description is empty, prompt the LLM to get the descriptions
-                    print("\nTechniques listed in the alert do not have descriptions. Attempting to get descriptions for these techniques...")
-                    # Get the prompt template and format it with the techniques tuple, detection query, and incident title
-                    prompt = config['PROMPT_TEMPLATE_FOR_MISSING_TECHNIQUE_DESCRIPTION'].format(
-                        techniques_list=techniques, detection_data=detection_query, alert_title=incident_title
-                    )
-
-                    techniques = prompt_for_mitre_attack_techniques(prompt, techniques)
-                else:
-                    # All descriptions are filled — exit loop
-                    break
-
-            # Complete the MITRE ATT&CK mapping and HTML output
-            print(f"\nPerforming MITRE ATT&CK mapping for techniques: {techniques}")
-            mitre_attack_map = get_mitre_attack_details.mitre_attack_html_section(techniques)
-            
             # ---------------- Investigation Query Pack ------------ #
 
             print("\nQuerying relevent logs for investigation notes...")
             # Extract entities from the alert
             entities = investigation_query_pack.extract_entities(incident_title, query_result)
             #print(entities)
-
 
         elif user_selection == '2':
             beep.beep()     # Play a notification sound for user attention
@@ -743,26 +751,24 @@ if __name__ == '__main__':
             beep.beep()     # Play a notification sound for user attention
             incident_title = input("Incident Title: ").strip()
             osint_checks = True  # Set the flag to indicate OSINT checks will be performed
-            
-            # Prompt for MITRE ATT&CK techniques
-            print(f"\nAttempting to find MITRE ATT&CK techniques related to the incident: {incident_title}")
-            techniques = ollama_prompt.mitre_mapper(incident_title, query_result_json, provider="ollama")  # Use OpenAI API to find techniques
-            if isinstance(techniques, str):
-                techniques = [t.strip() for t in techniques.split(",") if t.strip()]
-            elif isinstance(techniques, list):
-                # Flatten any comma-separated strings in the list
-                flat_techniques = []
-                for t in techniques:
-                    flat_techniques.extend([x.strip() for x in t.split(",") if x.strip()])
-                techniques = flat_techniques
 
-            #mitre_attack_map = get_mitre_attack_details.find_matching_techniques(incident_title, query_result)
-            mitre_attack_map = get_mitre_attack_details.mitre_attack_html_section(techniques)
+            # Read the events JSON file for the LLM prompt
+            with open(query_result_json, "r", encoding="utf-8") as f:
+                query_result_json = json.load(f)
+            # Get the prompt template and format it with the detection query and incident title
+            prompt = config['PROMPT_TEMPLATE_FOR_MITRE_ATTACK_TECHNIQUES'].format(
+                events_query=f"Events:\n{query_result_json}", alert_title=incident_title
+            )
 
         elif user_selection == '3':
             print("Exiting the tool. Goodbye!")
             exit(0)
-        
+
+        # ---------------- LLM MITRE ATT&CK Mapping and HTML Output ------------ #
+        mitre_attack_map = prompt_for_mitre_attack_techniques(prompt, incident_title=incident_title)
+
+        # ---------------- OSINT Checks ------------ #
+
         if osint_checks:        # Perform OSINT checks if the flag is set
             # Prompt user for OSINT check confirmation with validation
             while True:
@@ -794,14 +800,20 @@ if __name__ == '__main__':
             domain_analysis = ""
             hash_analysis = ""
 
+        # ---------------- HTML Build ------------ #
+
         # Build the HTML content
             # Create an HTML file with the content and save it
         with open("report.html", "w", encoding="utf-8") as file:
             file.write(generate_html_report(incident_no, incident_title, query_result, ABIPDB_analysis, skipped_ip_analysis, domain_analysis, hash_analysis, mitre_attack_map))
         print("\nHTML file 'report.html' created successfully.")
 
-        # open the HTML file in notepad
+        # ---------------- Show the completed HTML Report ------------ #
+
+        # open the HTML file in browser
         webbrowser.open("report.html")
+
+        # ---------------- End Timer and Complete Execution ------------ #
         end_time = time.perf_counter()  # end timer
         elapsed = end_time - start_time
         beep.beep()     # Play a notification sound for user attention
