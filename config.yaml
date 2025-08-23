@@ -85,55 +85,79 @@ OFFICE_ACTIVITY_KQL: |
 # --------------- LLM Prompts --------------- #
 
 PROMPT_TEMPLATE_FOR_MITRE_ATTACK_TECHNIQUES: |
-  IMPORTANT - OUTPUT FORMAT REQUIREMENTS:
-  You MUST respond ONLY with a valid Python list of tuples, in this exact form:
-  [('T####', 'short explanation'), ('T####', 'short explanation'), ...]
+  You are a cybersecurity reasoning assistant that maps alerts to MITRE ATT&CK techniques (version 17.1).
 
-  Rules:
-  - Each tuple = (TechniqueID, Short explanation).
-  - TechniqueID must be a valid MITRE ATT&CK ID (e.g., "T1046").
-  - The Short explanation must be concise and tailored to the alert context.
-  - DO NOT include MITRE technique names.
-  - DO NOT include any commentary, reasoning, or extra text outside the list.
-  - DO NOT add headers, markdown, or explanations - ONLY the list.
+  Task
+  Given:
+  - Alert Title
+  - Detection Query (KQL/SPL/XQL/etc.)
+  - Event Data Snippet, if provided (a small excerpt of actual matched results)
 
-  ---
+  Produce a STRICT JSON array describing the top matching ATT&CK techniques. Each element must have:
+  - "technique_id" — a valid ATT&CK Technique or Sub-technique ID, formatted T#### or T####.### from MITRE ATT&CK v17.1.
+  - "reason" — a concise explanation (<= 25 words) linking the alert to the technique using evidence from the query/snippet.
 
-  Given the following security alert details, determine the most relevant MITRE ATT&CK techniques based on the activity described.
+  Hard Rules
+  1. Output ONLY JSON — no prose, no markdown fences, no headings, no comments.
+  2. JSON must be a single array [...]. No wrapper keys.
+  3. Include only the two fields per object: technique_id, reason. No extra fields.
+  4. Use v17.1 technique IDs only. Prefer sub-techniques when the query/snippet clearly indicates them.
+  5. Base mappings on observable signals in the query/snippet (e.g., processes, commands, API calls, cloud actions, auth artifacts). No speculation.
+  6. If evidence is insufficient, return an empty array [].
+  7. Return at most 3 techniques, ordered by strongest evidence first.
+  8. The reason must reference concrete indicators (e.g., command/path/event/provider/operation), not generic statements.
 
+  Evidence Examples (non-exhaustive)
+  - Process/command lines (cmd.exe /c, powershell -enc, /bin/sh, reg add, schtasks, bitsadmin, curl, wmic, vssadmin, rundll32)
+  - File/registry/service/scheduled task changes
+  - Cloud actions (IAM role changes, key creation/use, bucket policies, MFA disablement)
+  - Auth/sign-in anomalies, token operations, OAuth/grant changes
+  - Network beacons, C2 patterns, exfil destinations, data staging paths
+
+  Validation
+  - Technique ID must match regex: ^T\d{4}(?:\.\d{3})?$
+  - Max 3 objects, each with exactly 2 keys: technique_id, reason.
+  - If multiple plausible techniques exist, choose those best supported by explicit artifacts.
+
+  example of the expected output (for model's output validation; follow exactly):
+
+  example output positive:
+  [
+    {
+      "technique_id": "<technique_id>",
+      "reason": "<explanation>"
+    },
+    {
+      "technique_id": "<technique_id>",
+      "reason": "<explanation>"
+    }
+  ]
+
+  example output negative:
+    []
+  
+
+  User Prompt Template
   Alert Title:
   {alert_title}
 
-  Detection Data/Query:
-  {detection_data}
+  {events_query}
 
-  Now return ONLY the list of tuples as specified above.
+  Return only the JSON array as specified.
 
-PROMPT_TEMPLATE_FOR_MISSING_TECHNIQUE_DESCRIPTION: |
-  IMPORTANT - OUTPUT FORMAT REQUIREMENTS:
-  You MUST respond ONLY with a valid Python list of tuples, in this exact form:
-  [('T####', 'short explanation'), ('T####', 'short explanation'), ...]
+example_output_positive: |
+  [
+    {
+      "technique_id": "T1059.001",
+      "reason": "Suspicious PowerShell command with -enc flag indicates potential execution of obfuscated code."
+    },
+    {
+      "technique_id": "T1059",
+      "reason": "Detection query identifies script interpreter execution consistent with command-line interface usage."
+    }
+  ]
 
-  Rules:
-  1. Each tuple = (Technique ID, Short Description).
-  2. If the Short Description is missing, empty, or whitespace-only:
-      - Replace it with a concise, alert-specific explanation of why that technique is relevant, based on the alert title and detection data.
-  3. If a description already exists, LEAVE IT UNCHANGED.
-  4. If context is insufficient, use exactly: "Relevant to alert behaviour based on alert context."
-  5. The output MUST be valid Python that can be parsed by ast.literal_eval().
-  6. DO NOT return empty strings for descriptions.
-  7. DO NOT include any commentary, reasoning, headers, or extra text - ONLY the Python list.
+example_output_negative: |
+  []
 
-  ---
-
-  Alert Title:
-  {alert_title}
-
-  Detection Data:
-  {detection_data}
-
-  Techniques List:
-  {techniques_list}
-
-  Now return ONLY the updated Python list of tuples as specified above.
 
