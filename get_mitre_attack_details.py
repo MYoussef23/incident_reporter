@@ -8,10 +8,10 @@ import ast  # For safe parsing of string-formatted dict/lists from CLI
 
 
 # Load MITRE ATT&CK Enterprise Matrix (latest version)
-def get_attack_store(domain):     # def get_data_from_version(domain, version):
+def get_attack_store(domain, version="17.1"):     # Get the latest version, which is 17.1 as per https://github.com/mitre-attack/attack-stix-data/tree/master
     #"""Get the ATT&CK STIX data for the given version from MITRE/CTI."""
     # Always fetch the latest bundle by omitting the version in the URL
-    url = f"https://raw.githubusercontent.com/mitre-attack/attack-stix-data/master/{domain}/{domain}.json"
+    url = f"https://raw.githubusercontent.com/mitre-attack/attack-stix-data/master/{domain}/{domain}-{version}.json"
     response = requests.get(url)
     # print data to csv
     if response.status_code != 200:
