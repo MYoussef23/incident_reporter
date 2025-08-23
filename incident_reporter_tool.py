@@ -1,9 +1,3 @@
-# Prerequisites:
-# 1. Python 3.x installed on your system.
-# 2. Required libraries installed (see requirements.txt).
-# 3. A configuration file named config.json with the necessary API keys and script paths.
-
-# Imports for the Azure/OSINT check functions
 import os
 import time
 from html import escape
@@ -19,6 +13,7 @@ import get_mitre_attack_details
 import ollama_prompt
 import investigation_query_pack
 import beep
+from typing import List, Tuple
 from pathlib import Path
 import webbrowser 
 import nest_asyncio
@@ -459,48 +454,119 @@ def prompt_for_mitre_attack_techniques(prompt, incident_title, techniques=None):
     #return techniques
     return mitre_attack_map
 
-def extract_techniques(text: str):
+_TID_RE = re.compile(r"^T\d{4}(?:\.\d{3})?$")
+
+def _strip_code_fences(s: str) -> str:
+    # Remove one full fenced block if the whole string is wrapped in it
+    fence = re.compile(r"^```(?:json|python|py|yaml|yml)?\s*([\s\S]*?)\s*```$", re.IGNORECASE)
+    m = fence.search(s.strip())
+    return m.group(1).strip() if m else s.strip()
+
+def _valid_tid(tid: str) -> bool:
+    return isinstance(tid, str) and bool(_TID_RE.match(tid.strip()))
+
+def extract_techniques(text: str) -> List[Tuple[str, str]]:
     """
-    Extract a list of (TechniqueID, Description) tuples from LLM output.
-    - Parses the first Python list of tuples found (even if wrapped in prose or code fences).
-    - Falls back to parsing 'Txxxx | desc' or 'Txxxx' lines.
+    Extract ATT&CK techniques from LLM output.
+
+    Supports (in order of preference):
+      1) Strict JSON array of objects:
+         [
+           {"technique_id": "T1059.001", "reason": "..."},
+           {"technique_id": "T1059", "reason": "..."}
+         ]
+      2) Python list of tuples (legacy):
+         [('T1059.001', '...'), ('T1059', '...')]
+      3) Line-based:
+         T1059.001 | reason text
+         T1059
+
+    Returns:
+      List[ (TechniqueID, Reason) ] with TechniqueID like T#### or T####.###.
     """
     if not isinstance(text, str):
         return []
 
-    s = text.strip()
+    s = _strip_code_fences(text)
 
-    # 1) Strip code fences if present
-    fence = re.compile(r"^```(?:python|py)?\s*([\s\S]*?)\s*```$", re.IGNORECASE)
-    m = fence.search(s)
-    if m:
-        s = m.group(1).strip()
+    # ---------- 1) Try full-string JSON first ----------
+    def json_to_tuples(obj) -> List[Tuple[str, str]]:
+        out = []
+        seen = set()
+        if isinstance(obj, list):
+            for item in obj:
+                if not isinstance(item, dict):
+                    continue
+                # Be tolerant of key casing
+                tid = item.get("technique_id") or item.get("TechniqueId") or item.get("techniqueId")
+                reason = item.get("reason") or item.get("Reason") or ""
+                if tid and _valid_tid(tid):
+                    pair = (tid.strip(), str(reason).strip())
+                    if pair[0] not in seen:
+                        seen.add(pair[0])
+                        out.append(pair)
+        return out
+    
+    try:
+        parsed = json.loads(s)
+        tuples = json_to_tuples(parsed)
+        if tuples:
+            return tuples
+        # If it was valid JSON but not the shape we want, continue to other strategies
+    except Exception:
+        pass
 
-    # 2) Find the first bracketed list and try to parse it
-    #    (works even when prose surrounds the list)
-    list_match = re.search(r"\[[\s\S]*?\]", s)      # non-greedy
+    # ---------- 1b) Try to find the first JSON array substring with objects ----------
+    # This pattern finds something that looks like: [ { ... }, { ... }, ... ]
+    for m in re.finditer(r"\[\s*{[\s\S]*?}\s*(?:,\s*{[\s\S]*?}\s*)*\s*\]", s):
+        try:
+            candidate = json.loads(m.group(0))
+            tuples = json_to_tuples(candidate)
+            if tuples:
+                return tuples
+        except Exception:
+            continue
+
+    # ---------- 2) Legacy: Python list-of-tuples anywhere in the text ----------
+    list_match = re.search(r"\[[\s\S]*?\]", s)  # non-greedy
     if list_match:
         snippet = list_match.group(0)
         try:
             parsed = ast.literal_eval(snippet)
-            if isinstance(parsed, list) and all(isinstance(t, tuple) and len(t) == 2 for t in parsed):
-                return [(str(t[0]).strip(), str(t[1]).strip()) for t in parsed]
+            if isinstance(parsed, list) and all(isinstance(t, tuple) and 1 <= len(t) <= 2 for t in parsed):
+                out: List[Tuple[str, str]] = []
+                seen = set()
+                for t in parsed:
+                    tid = str(t[0]).strip()
+                    reason = str(t[1]).strip() if len(t) > 1 else ""
+                    if _valid_tid(tid) and tid not in seen:
+                        seen.add(tid)
+                        out.append((tid, reason))
+                if out:
+                    return out
         except Exception:
-            pass  # fall through to line-based parsing
+            pass  # fall through
 
-    # 3) Fallback: parse line-based outputs like "T1046 | desc" or just "T1046"
-    out = []
-    for ln in [ln.strip() for ln in s.splitlines() if ln.strip()]:
-        # Accept if the line contains a Technique ID anywhere
-        m = re.search(r"\b(T\d{4,5})\b", ln)
+    # ---------- 3) Fallback: line-based "T####(.###)? | desc" or just "T####(.###)?" ----------
+    out: List[Tuple[str, str]] = []
+    seen = set()
+    for ln in (ln.strip() for ln in s.splitlines() if ln.strip()):
+        # find first technique ID in the line
+        m = re.search(r"\bT\d{4}(?:\.\d{3})?\b", ln)
         if not m:
             continue
-        tid = m.group(1)
+        tid = m.group(0)
+        if not _valid_tid(tid) or tid in seen:
+            continue
         if "|" in ln:
+            # split only on first pipe
             _, desc = ln.split("|", 1)
-            out.append((tid, desc.strip()))
+            reason = desc.strip()
         else:
-            out.append((tid, ""))
+            reason = ""
+        seen.add(tid)
+        out.append((tid, reason))
+
     return out
 
 def normalize_techniques(techniques_llm, techniques):
@@ -708,7 +774,6 @@ if __name__ == '__main__':
             prompt = config['PROMPT_TEMPLATE_FOR_MITRE_ATTACK_TECHNIQUES'].format(
                 events_query=f"KQL:\n{detection_query}\n\nEvents:\n{query_result_json}", alert_title=incident_title
             )
-            #mitre_attack_map = prompt_for_mitre_attack_techniques(prompt, incident_title=incident_title)
 
             # ---------------- Investigation Query Pack ------------ #
 
