@@ -12,6 +12,7 @@ import osint_scanner
 import get_mitre_attack_details
 import ollama_prompt
 import investigation_query_pack
+from obfuscate_data import obfuscate_json
 import beep
 from typing import List, Tuple
 from pathlib import Path
@@ -770,9 +771,11 @@ if __name__ == '__main__':
             # Read the events JSON file for the LLM prompt
             with open(query_result_json, "r", encoding="utf-8") as f:
                 query_result_json = json.load(f)
+            # Obfuscate the system information in the events for data privacy
+            snippet_obj = obfuscate_json(query_result_json, json_fields={"AccountUPN","Host","Email"})
             # Get the prompt template and format it with the detection query and incident title
             prompt = config['PROMPT_TEMPLATE_FOR_MITRE_ATTACK_TECHNIQUES'].format(
-                events_query=f"KQL:\n{detection_query}\n\nEvents:\n{query_result_json}", alert_title=incident_title
+                events_query=f"KQL:\n{detection_query}\n\nEvents:\n{snippet_obj}", alert_title=incident_title
             )
 
             # ---------------- Investigation Query Pack ------------ #
@@ -820,9 +823,11 @@ if __name__ == '__main__':
             # Read the events JSON file for the LLM prompt
             with open(query_result_json, "r", encoding="utf-8") as f:
                 query_result_json = json.load(f)
+            # Obfuscate the system information in the events for data privacy
+            snippet_obj = obfuscate_json(query_result_json, json_fields={"AccountUPN","Host","Email"})
             # Get the prompt template and format it with the detection query and incident title
             prompt = config['PROMPT_TEMPLATE_FOR_MITRE_ATTACK_TECHNIQUES'].format(
-                events_query=f"Events:\n{query_result_json}", alert_title=incident_title
+                events_query=f"Events:\n{snippet_obj}", alert_title=incident_title
             )
 
         elif user_selection == '3':
