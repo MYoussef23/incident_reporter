@@ -26,6 +26,8 @@ import win32com.client
 
 warnings.simplefilter('ignore', InsecureRequestWarning)
 
+MITRE_VERSION = 17.1            # Get the latest version, which is 17.1 as per https://github.com/mitre-attack/attack-stix-data/tree/master
+
 def close_excel_with_file_open(filename):
     try:
         excel = win32com.client.GetActiveObject("Excel.Application")
@@ -390,7 +392,7 @@ def run_detection_queries_on_alerts(alerts, workspace_id, alert_link_query):  # 
     
     return alerts[0]["IncidentTitle"], all_query_results, tactics, techniques, product_name, detection_query, json_filename
 
-def prompt_for_mitre_attack_techniques(prompt, incident_title, techniques=None):
+def prompt_for_mitre_attack_techniques(prompt, incident_title, MITRE_VERSION, techniques=None):
     # Ask the user if they wish to proceed
     user_choice = input("⚠️ Do you want to perform MITRE ATT&CK mapping for this alert? (y/n): ").strip().lower()
 
@@ -442,7 +444,7 @@ def prompt_for_mitre_attack_techniques(prompt, incident_title, techniques=None):
 
             # Complete the MITRE ATT&CK mapping and HTML output
             print(f"\nPerforming MITRE ATT&CK mapping for techniques: {techniques}")
-            mitre_attack_map = get_mitre_attack_details.mitre_attack_html_section(techniques)
+            mitre_attack_map = get_mitre_attack_details.mitre_attack_html_section(techniques, MITRE_VERSION)
         
         elif user_choice in ("n", "no"):
             print("❌ MITRE ATT&CK mapping skipped by user choice.")
@@ -763,27 +765,28 @@ if __name__ == '__main__':
 
             if product_name.lower().endswith("sentinel"):
                 osint_checks = True # Set the flag to indicate OSINT checks will be performed on those alerts where the alert is from Sentinel
+
+                # ---------------- LLM MITRE ATT&CK Mapping and HTML Output ------------ #
+
+                # Read the events JSON file for the LLM prompt
+                with open(query_result_json, "r", encoding="utf-8") as f:
+                    query_result_json = json.load(f)
+                # Obfuscate the system information in the events for data privacy
+                snippet_obj = obfuscate_json(query_result_json, json_fields={"AccountUPN","Host","Email"})
+                # Get the prompt template and format it with the detection query and incident title
+                prompt = config['PROMPT_TEMPLATE_FOR_MITRE_ATTACK_TECHNIQUES'].format(
+                    MITRE_VERSION=MITRE_VERSION, ALERT_DETAILS=f"KQL:\n{detection_query}\n\nEvents:\n{snippet_obj}", ALERT_TITLE=incident_title
+                )
+
+                # ---------------- Investigation Query Pack ------------ #
+
+                print("\nQuerying relevent logs for investigation notes...")
+                # Extract entities from the alert
+                entities = investigation_query_pack.extract_entities(incident_title, query_result)
+                #print(entities)
+                
             else:
                 osint_checks = False  # Set the flag to indicate OSINT checks will not be performed on those alerts where the alert is not from Sentinel
-
-            # ---------------- LLM MITRE ATT&CK Mapping and HTML Output ------------ #
-
-            # Read the events JSON file for the LLM prompt
-            with open(query_result_json, "r", encoding="utf-8") as f:
-                query_result_json = json.load(f)
-            # Obfuscate the system information in the events for data privacy
-            snippet_obj = obfuscate_json(query_result_json, json_fields={"AccountUPN","Host","Email"})
-            # Get the prompt template and format it with the detection query and incident title
-            prompt = config['PROMPT_TEMPLATE_FOR_MITRE_ATTACK_TECHNIQUES'].format(
-                events_query=f"KQL:\n{detection_query}\n\nEvents:\n{snippet_obj}", alert_title=incident_title
-            )
-
-            # ---------------- Investigation Query Pack ------------ #
-
-            print("\nQuerying relevent logs for investigation notes...")
-            # Extract entities from the alert
-            entities = investigation_query_pack.extract_entities(incident_title, query_result)
-            #print(entities)
 
         elif user_selection == '2':
             beep.beep()     # Play a notification sound for user attention
@@ -827,7 +830,7 @@ if __name__ == '__main__':
             snippet_obj = obfuscate_json(query_result_json, json_fields={"AccountUPN","Host","Email"})
             # Get the prompt template and format it with the detection query and incident title
             prompt = config['PROMPT_TEMPLATE_FOR_MITRE_ATTACK_TECHNIQUES'].format(
-                events_query=f"Events:\n{snippet_obj}", alert_title=incident_title
+                MITRE_VERSION=MITRE_VERSION, ALERT_DETAILS=f"Events:\n{snippet_obj}", ALERT_TITLE=incident_title
             )
 
         elif user_selection == '3':
@@ -835,7 +838,7 @@ if __name__ == '__main__':
             exit(0)
 
         # ---------------- LLM MITRE ATT&CK Mapping and HTML Output ------------ #
-        mitre_attack_map = prompt_for_mitre_attack_techniques(prompt, incident_title=incident_title)
+        mitre_attack_map = prompt_for_mitre_attack_techniques(prompt, incident_title=incident_title, MITRE_VERSION=MITRE_VERSION)
 
         # ---------------- OSINT Checks ------------ #
 

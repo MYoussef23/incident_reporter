@@ -36,6 +36,8 @@ def run_ollama(prompt: str, ollama_model: str = "llama3", max_retries: int = 3) 
                 model=ollama_model,
                 messages=[{"role": "user", "content": prompt}],
                 stream=False,
+                options={"temperature": 0.2},
+                format="json"  # asks Ollama to produce JSON
             )
             return resp["message"]["content"]
         except Exception as e:
