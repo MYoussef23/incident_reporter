@@ -5,15 +5,15 @@ import json
 import yaml
 import re
 import ast
-import azure_monitor_get_workspace
-import azure_monitor_logs_run_query
+from azure_monitor_get_workspace import azure_monitor_login
+from azure_monitor_logs_run_query import run_query
 import iocextract
 import osint_scanner
-import get_mitre_attack_details
-import ollama_prompt
+from get_mitre_attack_details import mitre_attack_html_section
+from ollama_prompt import run_ollama
 import investigation_query_pack
 from obfuscate_data import obfuscate_json
-import beep
+from beep import beep
 from typing import List, Tuple
 from pathlib import Path
 import webbrowser 
@@ -52,7 +52,7 @@ def close_excel_with_file_open(filename):
 def get_valid_incident_id():
     while True:
         incident_id = get_incident_number()
-        beep.beep()     # Play a notification sound for user attention
+        beep()    # Play a notification sound for user attention
         user_continue = input(f"\nYou have selected Incident ID: {incident_id}. Do you want to continue? (Y/N): ").strip().lower()
         if user_continue in ['y', 'yes']:
             return incident_id  # Proceed with this incident ID
@@ -60,12 +60,12 @@ def get_valid_incident_id():
             print("Let's enter a different Incident ID.")
             continue
         else:
-            beep.beep()     # Play a notification sound for user attention
+            beep()    # Play a notification sound for user attention
             print("Invalid input. Please enter 'Y' to continue or 'N' to re-enter the Incident ID.")
 
 def get_incident_number():      # This will loop till the user enters a valid entry which is a positive integer (Sentinel works off positive integer incident number types)
     while True:
-            beep.beep()     # Play a notification sound for user attention
+            beep()    # Play a notification sound for user attention
             incident_id = input("Enter the Incident ID: ").strip()
             try:
                 if incident_id.isdigit():
@@ -73,10 +73,10 @@ def get_incident_number():      # This will loop till the user enters a valid en
                     if incident_id > 0:
                         return incident_id
                 else:
-                    beep.beep()     # Play a notification sound for user attention
+                    beep()    # Play a notification sound for user attention
                     print("❌ Invalid input. Please enter a valid incident number, which for Sentinel is a numeric value.")
             except ValueError:
-                beep.beep()     # Play a notification sound for user attention
+                beep()    # Play a notification sound for user attention
                 print("❌ Invalid input. Please enter a valid incident number, which for Sentinel is a numeric value.")
 
 def save_to_csv(table, filename_csv, filename_json):
@@ -338,7 +338,7 @@ def run_detection_queries_on_alerts(alerts, workspace_id, alert_link_query):  # 
         if product_name.lower().endswith("sentinel"):    # If the product name ends with "Sentinel", run the detection query
             print(f"\nRunning detection query for Alert {idx}: {incident_title} ({alert_id})")
             timespan = f"{start_time_utc}/{end_time_utc}"
-            query_table = azure_monitor_logs_run_query.run_query(workspace_id, detection_query, timespan)
+            query_table = run_query(workspace_id, detection_query, timespan)
 
             # Export results to CSV (unique file for each alert)
             csv_filename = f"query_table_alert_{idx}.csv"
@@ -375,7 +375,7 @@ def run_detection_queries_on_alerts(alerts, workspace_id, alert_link_query):  # 
             all_query_results.append(query_result)
 
         else:   # Get the alert link
-            alert_links = azure_monitor_logs_run_query.run_query(workspace_id, alert_link_query, timespan="P7D")
+            alert_links = run_query(workspace_id, alert_link_query, timespan="P7D")
             # Extract the actual link(s) from the query result
             if alert_links and "rows" in alert_links and alert_links["rows"]:
                 # Support for multiple links, though usually just one per alert
@@ -417,7 +417,7 @@ def prompt_for_mitre_attack_techniques(prompt, incident_title, MITRE_VERSION, te
             print("====================\n")
 
             # Prompt the LLM to find techniques related to the alert
-            mitre_output = ollama_prompt.run_ollama(prompt)
+            mitre_output = run_ollama(prompt)
             if mitre_output == "s":
                 mitre_attack_map = ""
                 break
@@ -444,7 +444,7 @@ def prompt_for_mitre_attack_techniques(prompt, incident_title, MITRE_VERSION, te
 
             # Complete the MITRE ATT&CK mapping and HTML output
             print(f"\nPerforming MITRE ATT&CK mapping for techniques: {techniques}")
-            mitre_attack_map = get_mitre_attack_details.mitre_attack_html_section(techniques, MITRE_VERSION)
+            mitre_attack_map = mitre_attack_html_section(techniques, MITRE_VERSION)
         
         elif user_choice in ("n", "no"):
             print("❌ MITRE ATT&CK mapping skipped by user choice.")
@@ -664,7 +664,7 @@ def generate_html_report(Incident_no, Incident_title, query_result, ABIPDB_analy
 # ------------ Run Script ------------ #
 def main_menu():
     while True:
-        beep.beep()     # Play a notification sound for user attention
+        beep()    # Play a notification sound for user attention
         print("\nMain Menu:")
         print("1. Use Azure Monitor Logs to obtain the detection query results")
         print("2. Use a CSV file containing the query results or enter event details manually (you will be prompted if you wish to select a CSV file or enter the event details manually using text input)")
@@ -673,11 +673,11 @@ def main_menu():
         
         if choice == '1':
             # Handle Azure Monitor Logs
-            beep.beep()     # Play a notification sound for user attention
+            beep()    # Play a notification sound for user attention
             user_selection = input("You have selected to use Azure Monitor Logs. Do you wish to continue? (Y/N)\n " \
                                     "Enter 'Y' to continue or 'N' to return to the main menu: ").strip().lower()
             while user_selection not in ['yes', 'y', 'no', 'n']:
-                beep.beep()     # Play a notification sound for user attention
+                beep()    # Play a notification sound for user attention
                 user_selection = input("Invalid selection. Please enter 'yes' or 'no': ").strip().lower()
             if user_selection in ['no', 'n']:
                 print("Returning to the main menu...")
@@ -686,11 +686,11 @@ def main_menu():
                 return '1'  # Return to indicate Azure Monitor Logs selection
         elif choice == '2':
             # Handle CSV file input
-            beep.beep()     # Play a notification sound for user attention
+            beep()    # Play a notification sound for user attention
             user_selection = input("You have selected to use a CSV file containing the query results. Do you wish to continue? (Y/N)\n " \
                                     "Enter 'Y' to continue or 'N' to return to the main menu: ").strip().lower()
             while user_selection not in ['yes', 'y', 'no', 'n']:
-                beep.beep()     # Play a notification sound for user attention
+                beep()    # Play a notification sound for user attention
                 user_selection = input("Invalid selection. Please enter 'Y' or 'N': ").strip().lower()
             if user_selection in ['no', 'n']:
                 print("Returning to the main menu...")
@@ -740,7 +740,7 @@ if __name__ == '__main__':
             
             print("\nYou have selected to use Azure Monitor Logs. Please ensure you have the necessary permissions to access the logs (recommended minimum: Log Analytics Reader role on the workspace).")
                 # Run the azure_monitor_login CLI to login to Azure to get the workspace ID
-            workspace_id = azure_monitor_get_workspace.azure_monitor_login()
+            workspace_id = azure_monitor_login()
                 
                 # Get the incident details
             incident_no = get_valid_incident_id()
@@ -749,11 +749,11 @@ if __name__ == '__main__':
             print(f"\nRetrieving detection details for incident ID: {incident_no} in workspace ID: {workspace_id}")
 
             query = config['incident_details_query'].format(incident_no=incident_no)
-            result = azure_monitor_logs_run_query.run_query(workspace_id, query, timespan="P1D")  # Run the query to get the incident details
+            result = run_query(workspace_id, query, timespan="P1D")  # Run the query to get the incident details
     
             if not result.get("rows"):
                 print("No results returned. Changing the time range from 1 day to 7 days")
-                result = azure_monitor_logs_run_query.run_query(workspace_id, query, timespan="P7D")
+                result = run_query(workspace_id, query, timespan="P7D")
                 if not result.get("rows"):
                     print("No results returned for time range of 7 days... Exiting the tool.")
                     exit(0)
@@ -784,15 +784,15 @@ if __name__ == '__main__':
                 # Extract entities from the alert
                 entities = investigation_query_pack.extract_entities(incident_title, query_result)
                 #print(entities)
-                
+
             else:
                 osint_checks = False  # Set the flag to indicate OSINT checks will not be performed on those alerts where the alert is not from Sentinel
 
         elif user_selection == '2':
-            beep.beep()     # Play a notification sound for user attention
+            beep()    # Play a notification sound for user attention
             csv_data_or_text = input("Do you wish to select a CSV file containing the query results or paste the incident details as text? (Enter 'csv' for file or 'text' for text): ").strip().lower()
             while csv_data_or_text not in ['csv', 'text']:
-                beep.beep()     # Play a notification sound for user attention
+                beep()    # Play a notification sound for user attention
                 csv_data_or_text = input("Invalid selection. Please enter 'csv' for file or 'text' for text: ").strip().lower()
             if csv_data_or_text == 'csv':
                 # Close any instances of the query_table.csv file before proceeding
@@ -816,10 +816,10 @@ if __name__ == '__main__':
                 print("No query results found. Please ensure that the CSV file is in the correct format and contains the necessary data.")
                 exit(1)
 
-            beep.beep()     # Play a notification sound for user attention
+            beep()    # Play a notification sound for user attention
             print("Please enter the incident number and title for the report.")
             incident_no = input("Incident Number: ").strip()
-            beep.beep()     # Play a notification sound for user attention
+            beep()    # Play a notification sound for user attention
             incident_title = input("Incident Title: ").strip()
             osint_checks = True  # Set the flag to indicate OSINT checks will be performed
 
@@ -845,7 +845,7 @@ if __name__ == '__main__':
         if osint_checks:        # Perform OSINT checks if the flag is set
             # Prompt user for OSINT check confirmation with validation
             while True:
-                beep.beep()     # Play a notification sound for user attention
+                beep()    # Play a notification sound for user attention
                 user_choice = input(
                     "📄 Please review the alert data in the generated Excel/CSV file first.\n"
                     "Would you like to perform OSINT checks on the indicators in this data? (y/n): "
@@ -853,7 +853,7 @@ if __name__ == '__main__':
                 if user_choice in ("y", "n"):
                     break
                 else:
-                    beep.beep()     # Play a notification sound for user attention
+                    beep()    # Play a notification sound for user attention
                     print("❌ Invalid input. Please enter 'y' for yes or 'n' for no.")
             if user_choice == "y":
                 print("[INFO] Starting OSINT checks...")
@@ -889,9 +889,9 @@ if __name__ == '__main__':
         # ---------------- End Timer and Complete Execution ------------ #
         end_time = time.perf_counter()  # end timer
         elapsed = end_time - start_time
-        beep.beep()     # Play a notification sound for user attention
+        beep()    # Play a notification sound for user attention
         print(f"⏱ Execution time: {format_elapsed(elapsed)}\n")
 
     except Exception as e:
-        beep.beep()     # Play a notification sound for user attention
+        beep()    # Play a notification sound for user attention
         print(f"Execution error: {e}")
