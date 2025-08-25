@@ -8,10 +8,10 @@ import ast  # For safe parsing of string-formatted dict/lists from CLI
 
 
 # Load MITRE ATT&CK Enterprise Matrix (latest version)
-def get_attack_store(domain, version="17.1"):     # Get the latest version, which is 17.1 as per https://github.com/mitre-attack/attack-stix-data/tree/master
+def get_attack_store(domain, MITRE_VERSION):     # Get the latest version, which is 17.1 as per https://github.com/mitre-attack/attack-stix-data/tree/master
     #"""Get the ATT&CK STIX data for the given version from MITRE/CTI."""
     # Always fetch the latest bundle by omitting the version in the URL
-    url = f"https://raw.githubusercontent.com/mitre-attack/attack-stix-data/master/{domain}/{domain}-{version}.json"
+    url = f"https://raw.githubusercontent.com/mitre-attack/attack-stix-data/master/{domain}/{domain}-{MITRE_VERSION}.json"
     response = requests.get(url)
     # print data to csv
     if response.status_code != 200:
@@ -57,7 +57,7 @@ def build_lookups(attack_store):
         }
     return techniques, tactic_lookup
 
-def mitre_attack_html_section(techniques):
+def mitre_attack_html_section(techniques, MITRE_VERSION):
     """
     Returns an HTML section listing MITRE ATT&CK tactics and techniques, 
     mapped per technique ID and description.
@@ -81,7 +81,7 @@ def mitre_attack_html_section(techniques):
     rows = []
     for matrix_key, matrix_name in matrices.items():
         try:
-            attack_store = get_attack_store(matrix_key)
+            attack_store = get_attack_store(matrix_key, MITRE_VERSION)
         except Exception as e:
             print(f"Error loading {matrix_key}: {e}")
             continue
