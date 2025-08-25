@@ -26,6 +26,8 @@ import win32com.client
 
 warnings.simplefilter('ignore', InsecureRequestWarning)
 
+#hello
+
 MITRE_VERSION = 17.1            # Get the latest version, which is 17.1 as per https://github.com/mitre-attack/attack-stix-data/tree/master
 
 def close_excel_with_file_open(filename):
