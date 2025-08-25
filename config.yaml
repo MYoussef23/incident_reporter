@@ -85,7 +85,7 @@ OFFICE_ACTIVITY_KQL: |
 # --------------- LLM Prompts --------------- #
 
 PROMPT_TEMPLATE_FOR_MITRE_ATTACK_TECHNIQUES: |
-  You are a cybersecurity reasoning assistant that maps alerts to MITRE ATT&CK techniques (version 17.1).
+  You are a cybersecurity reasoning assistant that maps alerts to MITRE ATT&CK techniques (version {MITRE_VERSION}).
 
   Task
   Given:
@@ -139,9 +139,9 @@ PROMPT_TEMPLATE_FOR_MITRE_ATTACK_TECHNIQUES: |
 
   User Prompt Template
   Alert Title:
-  {alert_title}
+  {ALERT_TITLE}
 
-  {events_query}
+  {ALERT_DETAILS}
 
   Return only the JSON array as specified.
 
