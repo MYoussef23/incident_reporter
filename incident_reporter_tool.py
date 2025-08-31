@@ -6,13 +6,12 @@ import yaml
 import re
 import ast
 from azure_monitor_get_workspace import azure_monitor_login
-from azure_monitor_logs_run_query import run_query
+from azure_monitor_logs_run_query import _query_log_analytics, _extract_first_table
 import iocextract
 import osint_scanner
 from get_mitre_attack_details import mitre_attack_html_section
 from ollama_prompt import run_ollama
 import investigation_query_pack
-from obfuscate_data import obfuscate_json
 from beep import beep
 from typing import List, Tuple
 from pathlib import Path
@@ -338,7 +337,8 @@ def run_detection_queries_on_alerts(alerts, workspace_id, alert_link_query):  # 
         if product_name.lower().endswith("sentinel"):    # If the product name ends with "Sentinel", run the detection query
             print(f"\nRunning detection query for Alert {idx}: {incident_title} ({alert_id})")
             timespan = f"{start_time_utc}/{end_time_utc}"
-            query_table = run_query(workspace_id, detection_query, timespan)
+            query_table = _query_log_analytics(workspace_id, detection_query, timespan, verify_tls=False)
+            query_table = _extract_first_table(query_table)  # Extract the first table from the result
 
             # Export results to CSV (unique file for each alert)
             csv_filename = f"query_table_alert_{idx}.csv"
@@ -375,7 +375,8 @@ def run_detection_queries_on_alerts(alerts, workspace_id, alert_link_query):  # 
             all_query_results.append(query_result)
 
         else:   # Get the alert link
-            alert_links = run_query(workspace_id, alert_link_query, timespan="P7D")
+            alert_links = _query_log_analytics(workspace_id, alert_link_query, timespan="P7D", verify_tls=False)
+            alert_links = _extract_first_table(alert_links)  # Extract the first table from the result
             # Extract the actual link(s) from the query result
             if alert_links and "rows" in alert_links and alert_links["rows"]:
                 # Support for multiple links, though usually just one per alert
@@ -749,15 +750,18 @@ if __name__ == '__main__':
             print(f"\nRetrieving detection details for incident ID: {incident_no} in workspace ID: {workspace_id}")
 
             query = config['incident_details_query'].format(incident_no=incident_no)
-            result = run_query(workspace_id, query, timespan="P1D")  # Run the query to get the incident details
-    
-            if not result.get("rows"):
+            #print(f"Running query to get incident details:\n{query}\n")
+            result = _query_log_analytics(workspace_id, query, timespan="P1D", verify_tls=False)  # Run the query to get the incident details
+            
+            #if not result.get("rows"):
+            if not result or not any(t.get("rows") for t in result.get("tables", [])):
                 print("No results returned. Changing the time range from 1 day to 7 days")
-                result = run_query(workspace_id, query, timespan="P7D")
-                if not result.get("rows"):
+                result = _query_log_analytics(workspace_id, query, timespan="P7D", verify_tls=False)
+                #if not result.get("rows"):
+                if not result or not any(t.get("rows") for t in result.get("tables", [])):
                     print("No results returned for time range of 7 days... Exiting the tool.")
                     exit(0)
-
+            result = _extract_first_table(result)  # Extract the first table from the result
             alerts, alert_id = prepare_results(result)  # Ensure result is in the expected format
             
             query = config['get_alert_link_query'].format(alert_id=alert_id)
@@ -772,10 +776,10 @@ if __name__ == '__main__':
                 with open(query_result_json, "r", encoding="utf-8") as f:
                     query_result_json = json.load(f)
                 # Obfuscate the system information in the events for data privacy
-                snippet_obj = obfuscate_json(query_result_json, json_fields={"AccountUPN","Host","Email"})
+                #snippet_obj = obfuscate_json(query_result_json, json_fields={"AccountUPN","Host","Email"})
                 # Get the prompt template and format it with the detection query and incident title
                 prompt = config['PROMPT_TEMPLATE_FOR_MITRE_ATTACK_TECHNIQUES'].format(
-                    MITRE_VERSION=MITRE_VERSION, ALERT_DETAILS=f"KQL:\n{detection_query}\n\nEvents:\n{snippet_obj}", ALERT_TITLE=incident_title
+                    MITRE_VERSION=MITRE_VERSION, ALERT_DETAILS=f"KQL:\n{detection_query}\n\nEvents:\n{query_result_json}", ALERT_TITLE=incident_title
                 )
 
                 # ---------------- Investigation Query Pack ------------ #
@@ -827,10 +831,10 @@ if __name__ == '__main__':
             with open(query_result_json, "r", encoding="utf-8") as f:
                 query_result_json = json.load(f)
             # Obfuscate the system information in the events for data privacy
-            snippet_obj = obfuscate_json(query_result_json, json_fields={"AccountUPN","Host","Email"})
+            #snippet_obj = obfuscate_json(query_result_json, json_fields={"AccountUPN","Host","Email"})
             # Get the prompt template and format it with the detection query and incident title
             prompt = config['PROMPT_TEMPLATE_FOR_MITRE_ATTACK_TECHNIQUES'].format(
-                MITRE_VERSION=MITRE_VERSION, ALERT_DETAILS=f"Events:\n{snippet_obj}", ALERT_TITLE=incident_title
+                MITRE_VERSION=MITRE_VERSION, ALERT_DETAILS=f"Events:\n{query_result_json}", ALERT_TITLE=incident_title
             )
 
         elif user_selection == '3':
