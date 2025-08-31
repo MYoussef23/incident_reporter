@@ -6,11 +6,12 @@ import json
 import shutil
 import subprocess
 from typing import Optional
+from beep import beep
 
 import requests
 
 try:
-    import beep  # optional convenience
+    from beep import beep  # optional convenience
     _HAS_BEEP = True
 except Exception:
     _HAS_BEEP = False
@@ -79,7 +80,7 @@ def get_azure_account_name() -> Optional[str]:
 def _maybe_beep():
     if _HAS_BEEP:
         try:
-            beep.beep()
+            beep()
         except Exception:
             pass
 
