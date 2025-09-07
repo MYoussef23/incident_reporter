@@ -1,7 +1,5 @@
 # SOC Automation Toolkit
 
-# SOC Automation Toolkit
-
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)
 ![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
 ![Security](https://img.shields.io/badge/Focus-SOC%20Automation-red.svg)
