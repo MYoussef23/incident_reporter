@@ -1,3 +1,13 @@
+"""
+Ollama Prompt Wrapper
+---------------------
+Utility for safely invoking a local Ollama LLM (default: llama3.1) with retry 
+logic, memory error handling, and user prompts to free resources if needed. 
+Designed for SOC automation workflows where MITRE ATT&CK mapping or enrichment 
+requires structured JSON responses from a local model.
+"""
+
+
 #!/usr/bin/env python3
 import os
 import time
@@ -22,7 +32,7 @@ def _looks_like_memory_error(err_msg: str) -> bool:
         ]
     )
 
-def run_ollama(prompt: str, ollama_model: str = "llama3", max_retries: int = 3) -> str:
+def run_ollama(prompt: str, ollama_model: str = "llama3.1:latest", max_retries: int = 3) -> str:
     """
     Call Ollama safely. If a failure occurs (esp. memory/OOM), prompt the user to
     close apps to free memory and press Enter to retry. Returns "" on final failure.
@@ -36,7 +46,14 @@ def run_ollama(prompt: str, ollama_model: str = "llama3", max_retries: int = 3) 
                 model=ollama_model,
                 messages=[{"role": "user", "content": prompt}],
                 stream=False,
-                options={"temperature": 0.2},
+                options={
+                    # Guardrails: low-variance decoding & short outputs
+                    "temperature": 0.1,
+                    "top_p": 0.9,
+                    "num_predict": 200,
+                    "num_ctx": 4096,  # reduce to 2048 if you hit OOM
+                    "num_thread": os.cpu_count() or 4,
+                },
                 format="json"  # asks Ollama to produce JSON
             )
             return resp["message"]["content"]
