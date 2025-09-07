@@ -136,6 +136,11 @@ python get_mitre_attack_details.py --techniques T1021.002,T1210
 - The OSINT Scanner was inspired by [OSINT_Scanner](https://github.com/jade-hill-sage/OSINT-Scanner) by Jade Hill.
 - MITRE ATT&CK data is sourced from mitre-attack/attack-stix-data.
 - Ollama integration requires a local Ollama installation.
+## ⚠️ Important Note on Outputs
+This toolkit is designed to **augment SOC investigations** by automating repetitive tasks such as IOC enrichment, MITRE ATT&CK mapping, and HTML report generation.  
+However, all outputs (including OSINT results, enrichment data, and LLM-generated mappings) should be **reviewed and validated by a human analyst** before being used for security decisions or escalations.
+
+Automation helps reduce time-to-triage, but it does **not replace analyst judgment**.
 ## 🙌 Contributing
 Pull requests and issues are welcome!
 Ideas for expansion:
