@@ -1,3 +1,12 @@
+"""
+MITRE ATT&CK Mapping Utility
+----------------------------
+Fetches the latest MITRE ATT&CK STIX data and provides helpers to map 
+alerts or extracted techniques to relevant ATT&CK tactics/techniques. 
+Supports generating CSV/HTML tables, fuzzy matching of alert keywords, 
+and integration into SOC reports for enriched investigation context.
+"""
+
 import requests
 from stix2 import Filter, MemoryStore
 import pandas as pd
@@ -5,6 +14,10 @@ import fire
 from rapidfuzz import fuzz
 import re
 import ast  # For safe parsing of string-formatted dict/lists from CLI
+
+import warnings
+from urllib3.exceptions import InsecureRequestWarning
+warnings.simplefilter('ignore', InsecureRequestWarning)
 
 
 # Load MITRE ATT&CK Enterprise Matrix (latest version)
