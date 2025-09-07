@@ -1,0 +1,29 @@
+# Core
+requests
+pandas
+PyYAML
+fire
+nest_asyncio
+rapidfuzz
+
+# OSINT / Networking
+vt-py
+ipwhois
+
+# MITRE ATT&CK / STIX
+stix2
+
+# LLM client
+ollama
+
+# IOC extraction
+iocextract
+
+# HTML parsing (used in MITRE HTML printing)
+beautifulsoup4
+
+# Optional, platform-specific
+pywin32; platform_system == "Windows"
+
+# Optional speedups/parsers (not required, but nice to have)
+lxml
