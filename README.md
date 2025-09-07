@@ -1,18 +1,27 @@
 # SOC Automation Toolkit
 
+# SOC Automation Toolkit
+
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)
+![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
+![Security](https://img.shields.io/badge/Focus-SOC%20Automation-red.svg)
+![MITRE ATT&CK](https://img.shields.io/badge/MITRE%20ATT%26CK-v17.1-orange.svg)
+![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)
+[![Build](https://github.com/MYoussef23/soc-automation-toolkit/actions/workflows/ci.yml/badge.svg)](https://github.com/MYoussef23/soc-automation-toolkit/actions/workflows/ci.yml)
+
+
 A collection of Python-based automation utilities to support Security Operations Center (SOC) workflows.  
 The toolkit focuses on streamlining **incident reporting**, **OSINT enrichment**, and **MITRE ATT&CK mapping**, with integration points for Azure Monitor Logs and local LLMs (Ollama).
 
 ---
 
 ## 📂 Repository Structure
-soc-automation-toolkit/
-
-├── incident_reporter_tool.py # Main tool: generates structured HTML reports for incidents
-├── osint_scanner.py # Fire-based CLI for AbuseIPDB & VirusTotal enrichment
-├── get_mitre_attack_details.py # Fetches MITRE ATT&CK STIX data & builds mappings
-├── ollama_prompt.py # Safe wrapper for local Ollama LLM (JSON output, retries)
-├── beep.py # Simple cross-platform terminal beep utility
+soc-automation-toolkit/<br>
+├── incident_reporter_tool.py # Main tool: generates structured HTML reports for incidents<br>
+├── osint_scanner.py # Fire-based CLI for AbuseIPDB & VirusTotal enrichment<br>
+├── get_mitre_attack_details.py # Fetches MITRE ATT&CK STIX data & builds mappings<br>
+├── ollama_prompt.py # Safe wrapper for local Ollama LLM (JSON output, retries)<br>
+├── beep.py # Simple cross-platform terminal beep utility<br>
 ├── config.yaml # Configuration file for queries & API keys
 
 ---
@@ -49,6 +58,7 @@ soc-automation-toolkit/
 Example:
 ```bash
 python osint_scanner.py ip --targets_file ips.txt --output_csv results/abuseipdb.csv
+```
 ### 3. MITRE ATT&CK Mapping Utility (get_mitre_attack_details.py)
 - Downloads MITRE ATT&CK STIX data (v17.1).
 - Maps alerts or extracted techniques to relevant ATT&CK tactics/techniques.
@@ -91,6 +101,7 @@ Define API keys in a config.json file:
 {
   "VT_api_key": "your-virustotal-api-key"
   "ABDB_api_key": "your-abuseipdb-api-key"
+}
 ```
 Prompt template for MITRE ATT&CK Mapping
 ```yaml
@@ -123,12 +134,10 @@ python osint_scanner.py hash --targets d41d8cd98f00b204e9800998ecf8427e --vt_api
 ```bash
 python get_mitre_attack_details.py --techniques T1021.002,T1210
 ```
-##🔔 Attribution
-- The OSINT Scanner was inspired by [https://github.com/jade-hill-sage/OSINT-Scanner](OSINT_Scanner) by Jade Hill.
+## 🔔 Attribution
+- The OSINT Scanner was inspired by [OSINT_Scanner](https://github.com/jade-hill-sage/OSINT-Scanner) by Jade Hill.
 - MITRE ATT&CK data is sourced from mitre-attack/attack-stix-data.
 - Ollama integration requires a local Ollama installation.
-## 📜 License
-MIT License - see LICENSE for details.
 ## 🙌 Contributing
 Pull requests and issues are welcome!
 Ideas for expansion:
