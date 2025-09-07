@@ -1,313 +1,367 @@
+
+"""
+Incident Reporter Tool
+----------------------
+An automation-focused SOC investigation assistant that generates structured 
+HTML reports for security incidents. It integrates with Azure Monitor Logs 
+and CSV data, runs OSINT enrichment (AbuseIPDB, VirusTotal), performs MITRE 
+ATT&CK mapping via local LLM (Ollama), and outputs analyst-ready reports. 
+
+Designed to streamline SOC workflows by combining query execution, indicator 
+extraction, enrichment, and documentation into a single tool.
+"""
+
+
+from __future__ import annotations
+
+import json
+import logging
 import os
+import platform
+import re
+import sys
 import time
 from html import escape
-import json
-import yaml
-import re
-import ast
-from azure_monitor_get_workspace import azure_monitor_login
-from azure_monitor_logs_run_query import _query_log_analytics, _extract_first_table
-import iocextract
-import osint_scanner
+from pathlib import Path
+from string import Template
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+
+# --- Optional/3rd-party imports guarded ---
+try:
+    import yaml  # type: ignore
+except Exception:  # pragma: no cover
+    yaml = None  # Will error only if YAML is actually requested
+
+try:
+    import pandas as pd  # type: ignore
+except Exception as e:  # pragma: no cover
+    print("ERROR: pandas is required. pip install pandas")
+    raise
+
+try:
+    from tkinter import Tk, filedialog  # type: ignore
+    _HAS_TK = True
+except Exception:
+    _HAS_TK = False
+
+try:
+    import win32com.client  # type: ignore
+    _HAS_WIN32COM = True
+except Exception:
+    _HAS_WIN32COM = False
+
+try:
+    import nest_asyncio  # type: ignore
+    _HAS_NEST_ASYNCIO = True
+except Exception:
+    _HAS_NEST_ASYNCIO = False
+
+# --- Project-local imports (assumed available) ---
+from azure_monitor_cli import azure_monitor_login, _query_log_analytics, _extract_first_table
+import iocextract  # type: ignore
+import osint_scanner  # type: ignore
 from get_mitre_attack_details import mitre_attack_html_section
 from ollama_prompt import run_ollama
-import investigation_query_pack
 from beep import beep
-from typing import List, Tuple
-from pathlib import Path
-import webbrowser 
-import nest_asyncio
-import warnings
-from urllib3.exceptions import InsecureRequestWarning
-from tkinter import Tk, filedialog
-import pandas as pd
-import win32com.client
 
-warnings.simplefilter('ignore', InsecureRequestWarning)
+# --- Constants ---
+MITRE_VERSION: float = 17.1  # ATT&CK v17.1
+REPORT_HTML = Path("report.html")
+LOG_FORMAT = "%(levelname)s: %(message)s"
 
-MITRE_VERSION = 17.1            # Get the latest version, which is 17.1 as per https://github.com/mitre-attack/attack-stix-data/tree/master
+_TID_RE = re.compile(r"^T\d{4}(?:\.\d{3})?$")
 
-def close_excel_with_file_open(filename):
+
+# ----------------------------------------------------------------------------
+# Utilities
+# ----------------------------------------------------------------------------
+def setup_logging(verbose: bool = True) -> None:
+    level = logging.INFO if verbose else logging.WARNING
+    logging.basicConfig(level=level, format=LOG_FORMAT)
+
+
+def prompt_yes_no(message: str) -> bool:
+    """Prompt user with a yes/no question; returns True for yes."""
+    while True:
+        beep()
+        ans = input(f"{message} (y/n): ").strip().lower()
+        if ans in {"y", "yes"}:
+            return True
+        if ans in {"n", "no"}:
+            return False
+        beep()
+        logging.error("Invalid input. Please enter 'y' or 'n'.")
+
+
+def validate_workspace_id(workspace_id: str) -> bool:
+    """Validate the Log Analytics workspace GUID format."""
+    return bool(re.match(r"^[0-9a-fA-F-]{36}$", workspace_id or ""))
+
+
+def format_elapsed(seconds: float) -> str:
+    """Format elapsed time as M min S sec."""
+    minutes = int(seconds // 60)
+    sec = seconds % 60
+    return f"{minutes}m {sec:.2f}s" if minutes > 0 else f"{sec:.2f}s"
+
+
+def close_excel_with_file_open(filename_fragment: str) -> None:
+    """
+    Try to close any open Excel workbook containing 'filename_fragment' in its FullName.
+    Only works on Windows when pywin32 is available.
+    """
+    if platform.system() != "Windows" or not _HAS_WIN32COM:
+        return
     try:
-        excel = win32com.client.GetActiveObject("Excel.Application")
-        # Copy list of workbooks to avoid iterator issues
-        workbooks = [wb for wb in excel.Workbooks]
-        closed_any = False
-        for wb in workbooks:
-            #if filename.lower() in wb.FullName.lower():
-            if '.csv' in wb.FullName.lower() and filename.lower() in wb.FullName.lower():
-                fullname = wb.FullName  # Save before closing for print
+        excel = win32com.client.GetActiveObject("Excel.Application")  # type: ignore
+    except Exception:
+        logging.info("Excel is not running; nothing to close.")
+        return
+
+    # enumerate first to avoid iterator invalidation
+    workbooks = [wb for wb in excel.Workbooks]
+    closed_any = False
+    for wb in workbooks:
+        try:
+            fullname = str(wb.FullName).lower()
+            if ".csv" in fullname and filename_fragment.lower() in fullname:
+                path_print = wb.FullName
                 wb.Close(SaveChanges=False)
-                print(f"Closed: {fullname}")
+                logging.info("Closed Excel workbook: %s", path_print)
                 closed_any = True
+        except Exception as e:  # pragma: no cover
+            logging.warning("Could not close workbook: %s", e)
+
+    try:
         if closed_any and excel.Workbooks.Count == 0:
             excel.Quit()
-    except Exception as e:
-        if hasattr(e, 'hresult') and e.hresult == -2147221021:
-            print("Excel is not running, nothing to close.")
-            return
-        print("Could not close Excel file:", e)
-
-def get_valid_incident_id():
-    while True:
-        incident_id = get_incident_number()
-        beep()    # Play a notification sound for user attention
-        user_continue = input(f"\nYou have selected Incident ID: {incident_id}. Do you want to continue? (Y/N): ").strip().lower()
-        if user_continue in ['y', 'yes']:
-            return incident_id  # Proceed with this incident ID
-        elif user_continue in ['n', 'no']:
-            print("Let's enter a different Incident ID.")
-            continue
-        else:
-            beep()    # Play a notification sound for user attention
-            print("Invalid input. Please enter 'Y' to continue or 'N' to re-enter the Incident ID.")
-
-def get_incident_number():      # This will loop till the user enters a valid entry which is a positive integer (Sentinel works off positive integer incident number types)
-    while True:
-            beep()    # Play a notification sound for user attention
-            incident_id = input("Enter the Incident ID: ").strip()
-            try:
-                if incident_id.isdigit():
-                    incident_id = int(incident_id)
-                    if incident_id > 0:
-                        return incident_id
-                else:
-                    beep()    # Play a notification sound for user attention
-                    print("❌ Invalid input. Please enter a valid incident number, which for Sentinel is a numeric value.")
-            except ValueError:
-                beep()    # Play a notification sound for user attention
-                print("❌ Invalid input. Please enter a valid incident number, which for Sentinel is a numeric value.")
-
-def save_to_csv(table, filename_csv, filename_json):
-    # put table data in dataframe
-    df = pd.DataFrame(table["rows"], columns=[col["name"] for col in table["columns"]])
-    # Save dataframe as CSV
-    df.to_csv(filename_csv, index=False)
-    # Save only the first 5 rows of the dataframe as JSON
-    df.head().to_json(filename_json, orient="records", indent=2)
+    except Exception:
+        pass
 
 
-#===================================================Query Results From File===================================================#
-    
-def get_query_results_from_file():
-    # Get the query result from file
-        # Prompt the user to select a CSV file
-    print("Please select a CSV file containing the query results.")
-    Tk().withdraw()  # Hide the root window
-    csv_file_path = filedialog.askopenfilename(
-        title="Select CSV File",
-        filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")]
-    )
-
-    if not csv_file_path:
-        print("No file selected. Exiting.")
-        exit(1)
-
-    # Read the CSV file contents as the query result
-    with open(csv_file_path, "r", encoding="utf-8-sig") as f:
-        # Convert the dataframe to HTML format in plain text format
-        query_result = f.read().replace('\n', '<br />')
-    
-    # Convert the CSV data to a JSON object
-    query_result_data = pd.read_csv(csv_file_path).head().to_dict(orient='records')
-    # Save json data to file
-    # Save the JSON data to a file
-    json_query_results = "query_result.json"
-    if os.path.exists(json_query_results):
-        os.remove(json_query_results)
-    with open("query_result.json", "w", encoding="utf-8") as json_file:
-        json.dump(query_result_data, json_file, indent=2)
-    
-    return query_result, json_query_results
-
-# ------------ Load Configuration File ------------ #
-
-# Function to load the configuration from a JSON file
-def load_config(file_path):
-    if not os.path.exists(file_path):
+# ----------------------------------------------------------------------------
+# Config loading
+# ----------------------------------------------------------------------------
+def load_config(file_path: Union[str, Path]) -> Dict[str, Any]:
+    """Load configuration from YAML or JSON file."""
+    file_path = Path(file_path)
+    if not file_path.exists():
         raise FileNotFoundError(f"Configuration file not found: {file_path}")
 
-    _, ext = os.path.splitext(file_path)
-    ext = ext.lower()
+    data = file_path.read_text(encoding="utf-8")
+    ext = file_path.suffix.lower()
 
-    with open(file_path, "r") as f:
-        data = f.read()
-        if ext in [".yaml", ".yml"]:
-            if yaml is None:
-                raise ImportError("PyYAML is not installed. Please install it with 'pip install pyyaml'.")
-            try:
-                config = yaml.safe_load(data)
-                return config
-            except yaml.YAMLError as e:
-                raise ValueError(f"Error parsing the YAML configuration file: {e}")
-        elif ext == ".json":
-            try:
-                config = json.loads(data)
-                return config
-            except json.JSONDecodeError as e:
-                raise ValueError(f"Error parsing the JSON configuration file: {e}")
-        else:
-            raise ValueError(f"Unsupported configuration file format: {ext}")
+    if ext in {".yaml", ".yml"}:
+        if yaml is None:
+            raise ImportError("PyYAML not installed. pip install pyyaml")
+        try:
+            cfg = yaml.safe_load(data)
+            if not isinstance(cfg, dict):
+                raise ValueError("YAML config root must be a mapping/object.")
+            return cfg
+        except Exception as e:
+            raise ValueError(f"Error parsing YAML config: {e}")
+    elif ext == ".json":
+        try:
+            cfg = json.loads(data)
+            if not isinstance(cfg, dict):
+                raise ValueError("JSON config root must be an object.")
+            return cfg
+        except Exception as e:
+            raise ValueError(f"Error parsing JSON config: {e}")
+    else:
+        raise ValueError(f"Unsupported config extension: {ext}")
 
-# ------------ IOC Extraction ------------ #
 
-def extract_iocs_in_data(csv_data):     # Extract all relevant IOC's from the query result
-    iocs = {
-        "ips": set(),
-        "domains": set(),
-        "hashes": set()
-        }
+# ----------------------------------------------------------------------------
+# IO helpers
+# ----------------------------------------------------------------------------
+def save_table_to_csv_and_preview_json(table: Dict[str, Any], filename_csv: Path, filename_json: Path) -> None:
+    """Persist query 'table' as CSV and a JSON preview of the first 5 rows."""
+    df = pd.DataFrame(table["rows"], columns=[c["name"] for c in table["columns"]])
 
-    def process_single_csv(single_csv):
-        # Normalize line breaks and parse as text
-        cleaned = single_csv.replace("<br />", ",")
-        # iocextract finds IOCs in arbitrary text—no need to tokenize by commas
+    # Retry loop for CSV save (Excel locks)
+    while True:
+        try:
+            df.to_csv(filename_csv, index=False, encoding="utf-8")
+            logging.info("Saved CSV: %s", filename_csv)
+            break
+        except PermissionError as e:
+            logging.warning("Could not write %s: %s", filename_csv, e)
+            print("👉 Please close the file if it's open (e.g., in Excel).")
+            choice = input("Press Enter to retry, or type 's' to skip saving CSV: ").strip().lower()
+            if choice == "s":
+                logging.info("Skipped saving CSV.")
+                break
+            time.sleep(1)
+
+    try:
+        df.head().to_json(filename_json, orient="records", indent=2, force_ascii=False)
+        logging.info("Saved JSON preview: %s", filename_json)
+    except Exception as e:
+        logging.warning("Failed to save JSON preview: %s", e)
+
+
+def select_csv_via_gui() -> Optional[Path]:
+    """Open a file dialog to select a CSV; returns path or None if cancelled."""
+    if not _HAS_TK:
+        logging.error("tkinter not available in this environment.")
+        return None
+    try:
+        Tk().withdraw()  # Hide the root window
+        path = filedialog.askopenfilename(
+            title="Select CSV File",
+            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")]
+        )
+        return Path(path) if path else None
+    except Exception as e:
+        logging.error("Failed to open file dialog: %s", e)
+        return None
+
+
+# ----------------------------------------------------------------------------
+# IOC extraction and OSINT
+# ----------------------------------------------------------------------------
+def extract_iocs_in_data(csv_like_html: Union[str, List[str]]) -> Dict[str, List[str]]:
+    """Extract IPs, domains, hashes from rendered CSV/HTML text chunks."""
+    iocs = {"ips": set(), "domains": set(), "hashes": set()}
+
+    def _process_chunk(chunk: str) -> None:
+        cleaned = chunk.replace("<br />", ",")
         iocs["ips"].update(
             ip for ip in iocextract.extract_ips(cleaned)
-            if osint_scanner.validate_IP(ip)  # Only keep IPs passing your check
+            if osint_scanner.validate_IP(ip)
         )
-
-        # Extract domains
-        domain_regex = r'\b(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}\b'
-        all_domains = re.findall(domain_regex, cleaned)
-        # Remove those that are actually IPs
-        domains = [d for d in all_domains if not re.match(r'^\d{1,3}(?:\.\d{1,3}){3}$', d)]
-
-        for d in set(domains):
-            if osint_scanner.validate_domain(d):
+        # Domains (exclude IPv4 lookalikes)
+        domain_regex = r"\b(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}\b"
+        for d in set(re.findall(domain_regex, cleaned)):
+            if not re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", d) and osint_scanner.validate_domain(d):
                 iocs["domains"].add(d)
+        iocs["hashes"].update(iocextract.extract_hashes(cleaned))
 
-        iocs["hashes"].update(iocextract.extract_hashes(cleaned))   # Extract hashes
-
-    # Check if csv_data is a list or a single string
-    if isinstance(csv_data, list):
-        for single_csv in csv_data:
-            process_single_csv(single_csv)
-    elif isinstance(csv_data, str):
-        process_single_csv(csv_data)
+    if isinstance(csv_like_html, list):
+        for s in csv_like_html:
+            _process_chunk(str(s))
+    elif isinstance(csv_like_html, str):
+        _process_chunk(csv_like_html)
     else:
-        raise TypeError("csv_data must be a string or a list of strings.")
+        raise TypeError("csv_like_html must be str or List[str]")
 
-    return {k: list(v) for k, v in iocs.items()}
+    return {k: sorted(v) for k, v in iocs.items()}
 
-# ------------OSINT Check------------ #
-def OSINT_check(query_result):
-    # Initialise variables for OSINT checks
+def osint_check(query_result_rendered: Union[str, List[str]], cfg: Dict[str, Any]) -> Tuple[str, str, str, str]:
+    """Run AbuseIPDB + VirusTotal checks for extracted IOCs; return HTML segments."""
     ABIPDB_analysis = ""
     skipped_ip_analysis = ""
     domain_analysis = ""
     hash_analysis = ""
-    org_cidrs = None        # Initialise org_cidrs to None for AbuseIPDB/VT domain checks
 
-    # Load configuration
-    config = load_config('config.json')  # Load the configuration file
-    VT_api_key = config["VT_api_key"]
-    ABDB_api_key = config["ABDB_api_key"]
+    VT_api_key = cfg.get("VT_api_key")
+    ABDB_api_key = cfg.get("ABDB_api_key")
 
-    print("🔍 Beginning IOC extraction from data...")
-    iocs = extract_iocs_in_data(query_result)
-    
-    # set the entity lists
-    ip_list = []
-    domain_list = []
-    file_hash_list = []
-        # Add IOC's to respective lists
-    ip_list += iocs.get("ips", [])
-    domain_list += iocs.get("domains", [])
-    file_hash_list += iocs.get("hashes", [])
+    logging.info("Extracting IOCs from data...")
+    iocs = extract_iocs_in_data(query_result_rendered)
+    ip_list = iocs.get("ips", [])
+    domain_list = iocs.get("domains", [])
+    file_hash_list = iocs.get("hashes", [])
+    org_cidrs = None
 
-    # Perform OSINT checks based on the entity type -------------------------------------
-
-        # IP addresses - AbuseIPDB
-    if ip_list:# Perform OSINT checks for IP addresses in AbuseIPDB
-        print(f"\nPerforming OSINT checks for IP addresses.")
-        # Complete IP analysis - AbuseIPDB
-        header, rows, org_cidrs, skipped_ips_by_cidr = osint_scanner.loop_abuseIP_check(ABDB_api_key, ip_list)
+    # AbuseIPDB: IPs
+    if ip_list:
+        logging.info("OSINT: checking IPs via AbuseIPDB (n=%d)", len(ip_list))
+        header, rows, org_cidrs, skipped = osint_scanner.loop_abuseIP_check(ABDB_api_key, ip_list)
         if header and rows:
             ABIPDB_analysis = (
                 "<p><a href=https://www.abuseipdb.com/>https://www.abuseipdb.com/</a> IP Analysis:</p>"
-                + "<table border='1'>" +
-                    "<tr>" + "".join(f"<th>{col}</th>" for col in header) + "</tr>" +
-                    "".join("<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>" for row in rows) +
-                "</table>"
+                + "<table border='1'>"
+                + "<tr>" + "".join(f"<th>{escape(str(c))}</th>" for c in header) + "</tr>"
+                + "".join("<tr>" + "".join(f"<td>{escape(str(cell))}</td>" for cell in row) + "</tr>" for row in rows)
+                + "</table>"
             )
-            # Prepare skipped report
-            if skipped_ips_by_cidr:
-                if len(skipped_ips_by_cidr) > 1:
-                    # Add the explanatory line before the bullet list
-                    skipped_ip_analysis = (
-                        "<p>The following IPs were not individually checked as they belong to the already-analysed network ranges:</p>"
-                        "<ul>"
-                    )
-                    for cidr, ips in skipped_ips_by_cidr.items():
-                        ip_str = ", ".join(ips)
-                        skipped_ip_analysis += f"<li><strong>{cidr}:</strong> {ip_str}</li>"
-                    skipped_ip_analysis += "</ul>"
-                else:
-                    # Only one CIDR: Just use a single line, no bullets
-                    cidr, ips = next(iter(skipped_ips_by_cidr.items()))
-                    ip_str = ", ".join(ips)
-                    skipped_ip_analysis = (
-                        f"<p>The following IPs were not individually checked as they belong to the already-analysed network range <strong>{cidr}</strong>: {ip_str}.</p>"
-                    )
+        # skipped
+        if skipped:
+            items = list(skipped.items())
+            if len(items) == 1:
+                cidr, ips = items[0]
+                skipped_ip_analysis = (
+                    f"<p>The following IPs were not individually checked as they belong to "
+                    f"the already-analysed network range <strong>{escape(cidr)}</strong>: {', '.join(map(escape, ips))}.</p>"
+                )
             else:
-                skipped_ip_analysis = ""
+                skipped_ip_analysis = "<p>The following IPs were not individually checked as they belong to the already-analysed network ranges:</p><ul>"
+                for cidr, ips in items:
+                    skipped_ip_analysis += f"<li><strong>{escape(cidr)}</strong>: {', '.join(map(escape, ips))}</li>"
+                skipped_ip_analysis += "</ul>"
 
-        # Domain Analysis - VirusTotal
+    # VirusTotal: Domains
     if domain_list:
-        # Perform OSINT checks for URLs in VirusTotal
-        print(f"\nPerforming OSINT checks for domains.")
-        # Complete domain Analysis - VirusTotal
+        logging.info("OSINT: checking domains via VirusTotal (n=%d)", len(domain_list))
         if org_cidrs is None:
             header, rows = osint_scanner.loop_domain_vt_check(VT_api_key, domain_list)
         else:
             header, rows = osint_scanner.loop_domain_vt_check(VT_api_key, domain_list, org_cidrs=org_cidrs)
         if header and rows:
-            # separate the header and rows with a comma
             domain_analysis = (
                 "<p><a href=https://www.virustotal.com/>https://www.virustotal.com/</a> Domain Analysis:</p>"
-                + "<table border='1'>" +
-                    "<tr>" + "".join(f"<th>{col}</th>" for col in header) + "</tr>" +
-                    "".join("<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>" for row in rows) +
-                "</table>"
+                + "<table border='1'>"
+                + "<tr>" + "".join(f"<th>{escape(str(c))}</th>" for c in header) + "</tr>"
+                + "".join("<tr>" + "".join(f"<td>{escape(str(cell))}</td>" for cell in row) + "</tr>" for row in rows)
+                + "</table>"
             )
-        else:
-            print("No external domains to check.")
 
-        # File hash - VirusTotal
+    # VirusTotal: File hashes
     if file_hash_list:
-        # Perform OSINT checks for file paths in VirusTotal
-        print(f"\nPerforming OSINT checks for file hashes: {file_hash_list}")
-        # Complete file hash analysis - VirusTotal
+        logging.info("OSINT: checking file hashes via VirusTotal (n=%d)", len(file_hash_list))
         header, rows = osint_scanner.loop_file_hash_vt_check(VT_api_key, file_hash_list)
         if header and rows:
-            # separate the header and rows with a comma
             hash_analysis = (
                 "<p><a href=https://www.virustotal.com/>https://www.virustotal.com/</a> File Hash Analysis:</p>"
-                + "<table border='1'>" +
-                    "<tr>" + "".join(f"<th>{col}</th>" for col in header) + "</tr>" +
-                    "".join("<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>" for row in rows) +
-                "</table>"
+                + "<table border='1'>"
+                + "<tr>" + "".join(f"<th>{escape(str(c))}</th>" for c in header) + "</tr>"
+                + "".join("<tr>" + "".join(f"<td>{escape(str(cell))}</td>" for cell in row) + "</tr>" for row in rows)
+                + "</table>"
             )
 
     return ABIPDB_analysis, skipped_ip_analysis, domain_analysis, hash_analysis
 
-def prepare_results(result):  # Ensure result is in the expected format
-    # Extract and return fields
-    alerts = []
-    for row in result["rows"]:
-        incident_title, product_name, alert_id, start_time_utc, end_time_utc, query, tactics, techniques  = row
+# ----------------------------------------------------------------------------
+# Query results + alert handling
+# ----------------------------------------------------------------------------
+def get_incident_number() -> int:
+    """Loop until a valid positive integer incident ID is entered."""
+    while True:
+        beep()
+        s = input("Enter the Incident ID: ").strip()
+        if s.isdigit():
+            v = int(s)
+            if v > 0:
+                return v
+        beep()
+        logging.error("Invalid input. Sentinel incident numbers are positive integers.")
 
-        print(f"Alert Title: {incident_title}")
-        print(f"Product Name: {product_name}")
-        print(f"Alert ID: {alert_id}")
-        print(f"Start Time (UTC): {start_time_utc}")
-        print(f"End Time (UTC): {end_time_utc}")
-        print(f"Query: {query}")
-        print(f"Tactics: {tactics}")
-        print(f"Techniques: {techniques}")
 
-        # Collect for further use
+def get_valid_incident_id() -> int:
+    """Ask for incident number, then confirm with user."""
+    while True:
+        incident_id = get_incident_number()
+        beep()
+        cont = input(f"Selected Incident ID: {incident_id}. Continue? (y/n): ").strip().lower()
+        if cont in {"y", "yes"}:
+            return incident_id
+        if cont in {"n", "no"}:
+            logging.info("Re-entering Incident ID...")
+            continue
+        beep()
+        logging.error("Invalid input. Please enter 'y' or 'n'.")
+
+
+def prepare_results(table: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Any]:
+    """Convert table rows to alert dicts and return (alerts, first_alert_id)."""
+    alerts: List[Dict[str, Any]] = []
+    for row in table["rows"]:
+        incident_title, product_name, alert_id, start_time_utc, end_time_utc, query, tactics, techniques = row
+        logging.info("Alert: %s | %s | %s", incident_title, product_name, alert_id)
+
         alerts.append({
             "IncidentTitle": incident_title,
             "ProductName": product_name,
@@ -316,13 +370,25 @@ def prepare_results(result):  # Ensure result is in the expected format
             "EndTimeUTC": end_time_utc,
             "Query": query,
             "Tactics": tactics,
-            "Techniques": techniques
+            "Techniques": techniques,
         })
+    return alerts, alerts[0]["AlertId"]
 
-    return alerts, alerts[0]['AlertId']  # Return the list of alerts for further processing
+def run_detection_queries_on_alerts(
+    alerts: Sequence[Dict[str, Any]],
+    workspace_id: str,
+    alert_link_query: str,
+) -> Tuple[str, List[str], Any, Any, str, Optional[str], Optional[Path]]:
+    """
+    For Sentinel alerts, run detection queries and save results to CSV/JSON.
+    For non-Sentinel alerts, fetch alert links.
 
-def run_detection_queries_on_alerts(alerts, workspace_id, alert_link_query):  # Run detection queries on the alerts
-    all_query_results = []
+    Returns:
+        (incident_title, rendered_results, product_name, detection_query, json_preview_path)
+    """
+    all_rendered: List[str] = []
+    json_preview_path: Optional[Path] = None
+    detection_query: Optional[str] = None
 
     for idx, alert in enumerate(alerts, start=1):
         incident_title = alert["IncidentTitle"]
@@ -331,197 +397,151 @@ def run_detection_queries_on_alerts(alerts, workspace_id, alert_link_query):  # 
         end_time_utc = alert["EndTimeUTC"]
         detection_query = alert["Query"]
         alert_id = alert["AlertId"]
-        tactics = alert["Tactics"]
-        techniques = alert["Techniques"]
 
-        if product_name.lower().endswith("sentinel"):    # If the product name ends with "Sentinel", run the detection query
-            print(f"\nRunning detection query for Alert {idx}: {incident_title} ({alert_id})")
+        if product_name.lower().endswith("sentinel"):
+            logging.info("Running detection query for Alert %d: %s (%s)", idx, incident_title, alert_id)
             timespan = f"{start_time_utc}/{end_time_utc}"
-            query_table = _query_log_analytics(workspace_id, detection_query, timespan, verify_tls=False)
-            query_table = _extract_first_table(query_table)  # Extract the first table from the result
+            table = _query_log_analytics(workspace_id, detection_query, timespan, verify_tls=False)
+            table = _extract_first_table(table)
 
-            # Export results to CSV (unique file for each alert)
-            csv_filename = f"query_table_alert_{idx}.csv"
-            json_filename = f"query_table_alert_{idx}.json"
-            save_to_csv(query_table, csv_filename, json_filename)
-            print(f"\nQuery result saved to {csv_filename}")
+            csv_path = Path(f"query_table_alert_{idx}.csv")
+            json_path = Path(f"query_table_alert_{idx}.json")
+            save_table_to_csv_and_preview_json(table, csv_path, json_path)
+            json_preview_path = json_path
 
-            # Open the file in default CSV viewer
-            print(f"Opening query result file: {csv_filename}...")
-            os.startfile(csv_filename)
-
-            # Get number of rows in the query_table
-            row_count = len(query_table["rows"])
-
-            # Normalise query_result into HTML format
-            columns = [col["name"] for col in query_table["columns"]]
-
-            if row_count < 100:     # If row count is less that 100, then normalise data in HTML format
-                rows = query_table["rows"]
-                note_html = ""
-                query_result = note_html + "<br />".join(
-                        [",".join(columns)] +
-                        [",".join(str(cell) for cell in row) for row in rows]
-                    )
-            else:   # Provide a CSV download link if more than 100 rows
-                print(f"⚠ Events exceed 100 rows ({row_count} rows). Displaying first 100 rows only in HTML output...")
-                rows = query_table["rows"][:100]
-                note_html = f"<p><strong>Showing first 100 of {row_count} events</strong></p>\n"
-                query_result = note_html + "<pre>" + "<br />".join(
-                        [",".join(columns)] +
-                        [",".join(str(cell) for cell in row) for row in rows]
-                    ) + "</pre>"
-            
-            all_query_results.append(query_result)
-
-        else:   # Get the alert link
-            alert_links = _query_log_analytics(workspace_id, alert_link_query, timespan="P7D", verify_tls=False)
-            alert_links = _extract_first_table(alert_links)  # Extract the first table from the result
-            # Extract the actual link(s) from the query result
-            if alert_links and "rows" in alert_links and alert_links["rows"]:
-                # Support for multiple links, though usually just one per alert
-                for row in alert_links["rows"]:
-                    alert_link = row[0]
-                    print(f"\nAlert Link for Alert {idx} ({product_name}): {incident_title} ({alert_id}\n{alert_link}")
-
-                    # format as HTML hyperlink
-                    html_link = f'<p>{product_name}: <a href="{alert_link}" target="_blank">{alert_link}</a></p>'
-                    all_query_results.append(html_link)
-            else:
-                print(f"No alert link found for Alert {idx} ({product_name}): {incident_title} ({alert_id})")
-                all_query_results.append(f"<p>No alert link found for this alert in {product_name}</p>")
-    
-    return alerts[0]["IncidentTitle"], all_query_results, tactics, techniques, product_name, detection_query, json_filename
-
-def prompt_for_mitre_attack_techniques(prompt, incident_title, MITRE_VERSION, techniques=None):
-    # Ask the user if they wish to proceed
-    user_choice = input("⚠️ Do you want to perform MITRE ATT&CK mapping for this alert? (y/n): ").strip().lower()
-
-    # Keep asking until valid input is given
-    while True:
-        if user_choice in ("y", "yes"):
-            #  make sure techniques is a list
-            if isinstance(techniques, str):
-                # If techniques is a string representation of a list, use ast.literal_eval
+            # Open the CSV if we're on Windows (os.startfile)
+            if platform.system() == "Windows":
                 try:
-                    techniques = ast.literal_eval(techniques)
+                    os.startfile(str(csv_path))  # type: ignore
                 except Exception:
-                    techniques = [t.strip() for t in techniques.split(",") if t.strip()]
-            
-            # Try to find techniques related to the alert using LLM prompt
-            print(f"\nAttempting to find MITRE ATT&CK techniques related to the alert: {incident_title}, using a local LLaMA3 LLM. This may take a minute on first run while the model loads...")
-            # --- Show the prompt being sent ---
-            print("\n====================")
-            print("📤 Prompt sent to Ollama:")
-            print("====================")
-            print(prompt)
-            print("====================\n")
+                    pass
 
-            # Prompt the LLM to find techniques related to the alert
-            mitre_output = run_ollama(prompt)
-            if mitre_output == "s":
-                mitre_attack_map = ""
-                break
+            columns = [c["name"] for c in table["columns"]]
+            rows = table["rows"]
+            row_count = len(rows)
 
-            # --- Show raw output from Ollama ---
-            print("\n====================")
-            print("📥 Raw output from Ollama:")
-            print("====================")
-            print(mitre_output)
-            print("====================\n")
-
-            # Extract techniques from LLM output
-            techniques_llm = extract_techniques(mitre_output)
-            # --- Show parsed techniques ---
-            print("\n====================")
-            print("✅ Parsed MITRE ATT&CK Techniques")
-            print("====================")
-            # Inspect what you actually have
-            print(f"type={type(techniques_llm)} len={len(techniques_llm)}")
-            print(techniques_llm)
-            print("====================\n")
-
-            techniques = normalize_techniques(techniques_llm, techniques)
-
-            # Complete the MITRE ATT&CK mapping and HTML output
-            print(f"\nPerforming MITRE ATT&CK mapping for techniques: {techniques}")
-            mitre_attack_map = mitre_attack_html_section(techniques, MITRE_VERSION)
-        
-        elif user_choice in ("n", "no"):
-            print("❌ MITRE ATT&CK mapping skipped by user choice.")
-            mitre_attack_map = ""
-            break
+            if row_count <= 100:
+                joined = "<br />".join([",".join(columns)] + [",".join(map(str, r)) for r in rows])
+                all_rendered.append(joined)
+            else:
+                head = rows[:100]
+                note = f"<p><strong>Showing first 100 of {row_count} events</strong></p>\n"
+                joined = "<br />".join([",".join(columns)] + [",".join(map(str, r)) for r in head])
+                all_rendered.append(note + "<pre>" + joined + "</pre>")
 
         else:
-            print("❌ Invalid input. Please enter 'y' or 'n'.")
+            # Non-Sentinel: fetch alert link(s)
+            links_table = _query_log_analytics(workspace_id, alert_link_query, timespan="P7D", verify_tls=False)
+            links_table = _extract_first_table(links_table)
+            if links_table and links_table.get("rows"):
+                for row in links_table["rows"]:
+                    link = str(row[0])
+                    html_link = f'<p>{escape(product_name)}: <a href="{escape(link)}" target="_blank">{escape(link)}</a></p>'
+                    all_rendered.append(html_link)
+            else:
+                all_rendered.append(f"<p>No alert link found for this alert in {escape(product_name)}</p>")
 
-    #return techniques
-    return mitre_attack_map
+    # Return from the *first* alert for meta fields
+    first = alerts[0]
+    return (
+        first["IncidentTitle"],
+        all_rendered,
+        first["ProductName"],
+        detection_query,
+        json_preview_path,
+    )
 
-_TID_RE = re.compile(r"^T\d{4}(?:\.\d{3})?$")
-
+# ----------------------------------------------------------------------------
+# MITRE helpers
+# ----------------------------------------------------------------------------
 def _strip_code_fences(s: str) -> str:
-    # Remove one full fenced block if the whole string is wrapped in it
     fence = re.compile(r"^```(?:json|python|py|yaml|yml)?\s*([\s\S]*?)\s*```$", re.IGNORECASE)
     m = fence.search(s.strip())
     return m.group(1).strip() if m else s.strip()
 
+
 def _valid_tid(tid: str) -> bool:
     return isinstance(tid, str) and bool(_TID_RE.match(tid.strip()))
 
+
 def extract_techniques(text: str) -> List[Tuple[str, str]]:
     """
-    Extract ATT&CK techniques from LLM output.
-
-    Supports (in order of preference):
-      1) Strict JSON array of objects:
-         [
-           {"technique_id": "T1059.001", "reason": "..."},
-           {"technique_id": "T1059", "reason": "..."}
-         ]
-      2) Python list of tuples (legacy):
-         [('T1059.001', '...'), ('T1059', '...')]
-      3) Line-based:
-         T1059.001 | reason text
-         T1059
-
-    Returns:
-      List[ (TechniqueID, Reason) ] with TechniqueID like T#### or T####.###.
+    Extract ATT&CK techniques from LLM output. Supports:
+      - JSON array of objects [{"technique_id","reason"}, ...]
+      - Single JSON object {"technique_id","reason"}  <-- NEW
+      - Dict-of-dicts { "Txxxx": {"technique_id","reason"}, ... }
+      - Python list-of-tuples
+      - Line-based "T####(.###)? | desc"
     """
     if not isinstance(text, str):
         return []
-
     s = _strip_code_fences(text)
 
-    # ---------- 1) Try full-string JSON first ----------
-    def json_to_tuples(obj) -> List[Tuple[str, str]]:
-        out = []
-        seen = set()
+    def json_to_tuples(obj: Any) -> List[Tuple[str, str]]:
+        out: List[Tuple[str, str]] = []
+        seen: set[str] = set()
+
+        # NEW: handle single object {"technique_id": "...", "reason": "..."}
+        if isinstance(obj, dict) and (
+            ("technique_id" in obj or "TechniqueId" in obj or "techniqueId" in obj)
+            and ("reason" in obj or "Reason" in obj)
+        ):
+            tid = obj.get("technique_id") or obj.get("TechniqueId") or obj.get("techniqueId")
+            reason = obj.get("reason") or obj.get("Reason") or ""
+            if tid and _valid_tid(tid):
+                tid = tid.strip()
+                pair = (tid, str(reason).strip())
+                if tid not in seen:
+                    seen.add(tid)
+                    out.append(pair)
+            return out  # done
+
         if isinstance(obj, list):
             for item in obj:
                 if not isinstance(item, dict):
                     continue
-                # Be tolerant of key casing
                 tid = item.get("technique_id") or item.get("TechniqueId") or item.get("techniqueId")
                 reason = item.get("reason") or item.get("Reason") or ""
                 if tid and _valid_tid(tid):
-                    pair = (tid.strip(), str(reason).strip())
-                    if pair[0] not in seen:
-                        seen.add(pair[0])
+                    tid = tid.strip()
+                    pair = (tid, str(reason).strip())
+                    if tid not in seen:
+                        seen.add(tid)
                         out.append(pair)
+            return out
+
+        # dict-of-dicts fallback
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if isinstance(v, dict):
+                    tid = v.get("technique_id") or v.get("TechniqueId") or v.get("techniqueId") or k
+                    reason = v.get("reason") or v.get("Reason") or ""
+                    if tid and _valid_tid(tid):
+                        tid = tid.strip()
+                        pair = (tid, str(reason).strip())
+                        if tid not in seen:
+                            seen.add(tid)
+                            out.append(pair)
+            return out
+
         return out
-    
+
+    # 1) Strict JSON first
     try:
         parsed = json.loads(s)
         tuples = json_to_tuples(parsed)
         if tuples:
             return tuples
-        # If it was valid JSON but not the shape we want, continue to other strategies
+
+        # NEW: if top-level is dict but not directly parseable, try coercing to array
+        if isinstance(parsed, dict):
+            tuples = json_to_tuples([parsed])
+            if tuples:
+                return tuples
     except Exception:
         pass
 
-    # ---------- 1b) Try to find the first JSON array substring with objects ----------
-    # This pattern finds something that looks like: [ { ... }, { ... }, ... ]
+    # 1b) First JSON array substring
     for m in re.finditer(r"\[\s*{[\s\S]*?}\s*(?:,\s*{[\s\S]*?}\s*)*\s*\]", s):
         try:
             candidate = json.loads(m.group(0))
@@ -531,15 +551,16 @@ def extract_techniques(text: str) -> List[Tuple[str, str]]:
         except Exception:
             continue
 
-    # ---------- 2) Legacy: Python list-of-tuples anywhere in the text ----------
-    list_match = re.search(r"\[[\s\S]*?\]", s)  # non-greedy
+    # 2) Python list-of-tuples
+    list_match = re.search(r"\[[\s\S]*?\]", s)
     if list_match:
         snippet = list_match.group(0)
         try:
-            parsed = ast.literal_eval(snippet)
+            import ast as _ast  # local import
+            parsed = _ast.literal_eval(snippet)
             if isinstance(parsed, list) and all(isinstance(t, tuple) and 1 <= len(t) <= 2 for t in parsed):
                 out: List[Tuple[str, str]] = []
-                seen = set()
+                seen: set[str] = set()
                 for t in parsed:
                     tid = str(t[0]).strip()
                     reason = str(t[1]).strip() if len(t) > 1 else ""
@@ -549,109 +570,125 @@ def extract_techniques(text: str) -> List[Tuple[str, str]]:
                 if out:
                     return out
         except Exception:
-            pass  # fall through
+            pass
 
-    # ---------- 3) Fallback: line-based "T####(.###)? | desc" or just "T####(.###)?" ----------
+    # 3) Line-based
     out: List[Tuple[str, str]] = []
-    seen = set()
+    seen: set[str] = set()
     for ln in (ln.strip() for ln in s.splitlines() if ln.strip()):
-        # find first technique ID in the line
         m = re.search(r"\bT\d{4}(?:\.\d{3})?\b", ln)
         if not m:
             continue
         tid = m.group(0)
         if not _valid_tid(tid) or tid in seen:
             continue
+        reason = ""
         if "|" in ln:
-            # split only on first pipe
             _, desc = ln.split("|", 1)
             reason = desc.strip()
-        else:
-            reason = ""
         seen.add(tid)
         out.append((tid, reason))
-
     return out
 
-def normalize_techniques(techniques_llm, techniques):
-    """
-    Normalize MITRE ATT&CK techniques from an LLM output into a list of (id, desc) tuples.
-    Supports input as string, list of strings, or list of tuples.
-    
-    Args:
-        techniques_llm (str | list): Raw techniques data from LLM.
-        techniques (list): Existing list of techniques to extend.
-    
-    Returns:
-        list: Normalized list of (id, desc) tuples.
-    """
-    if isinstance(techniques_llm, str):
-        # Split string into tuples (id, desc)
-        techniques_llm = [
-            tuple(map(str.strip, entry.split("|", 1)))
-            for entry in re.split(r'[\n]+', techniques_llm)
-            if entry.strip()
-        ]
+def normalize_techniques(techniques_llm: Union[str, List[Union[str, Tuple[str, str]]]],
+                         techniques: Optional[List[Tuple[str, str]]]) -> List[Tuple[str, str]]:
+    """Normalize to a list of (technique_id, reason) tuples and deduplicate by ID."""
+    flat: List[Tuple[str, str]] = []
 
+    def _add_pair(tid: str, reason: str = ""):
+        tid, reason = tid.strip(), reason.strip()
+        if tid:
+            flat.append((tid, reason))
+
+    if isinstance(techniques_llm, str):
+        for entry in re.split(r"[\n]+", techniques_llm):
+            entry = entry.strip()
+            if not entry:
+                continue
+            if "|" in entry:
+                tid, reason = entry.split("|", 1)
+                _add_pair(tid, reason)
+            else:
+                _add_pair(entry, "")
     elif isinstance(techniques_llm, list):
-        flat_techniques_llm = []
         for t in techniques_llm:
             if isinstance(t, tuple):
-                # Already in (id, desc) form
-                flat_techniques_llm.append((t[0].strip(), t[1].strip() if len(t) > 1 else ""))
+                if len(t) == 1:
+                    _add_pair(str(t[0]), "")
+                else:
+                    _add_pair(str(t[0]), str(t[1]))
             elif isinstance(t, str):
-                # Split string into entries
-                for entry in re.split(r'[\n]+', t):
-                    if entry.strip():
-                        parts = entry.split("|", 1)
-                        flat_techniques_llm.append(
-                            (parts[0].strip(), parts[1].strip() if len(parts) > 1 else "")
-                        )
-        techniques_llm = flat_techniques_llm
+                for entry in re.split(r"[\n]+", t):
+                    entry = entry.strip()
+                    if not entry:
+                        continue
+                    if "|" in entry:
+                        tid, reason = entry.split("|", 1)
+                        _add_pair(tid, reason)
+                    else:
+                        _add_pair(entry, "")
 
-    # Extend techniques with new data
-    if techniques:
-        if techniques_llm:
-            techniques.extend(techniques_llm)
+    base = techniques[:] if techniques else []
+    base.extend(flat)
+
+    # Normalize and deduplicate by technique_id (keep last occurrence)
+    norm = []
+    seen: Dict[str, int] = {}
+    for pair in base:
+        tid, reason = (pair if isinstance(pair, tuple) else (str(pair), ""))
+        tid = tid.strip()
+        reason = (reason or "").strip()
+        if not tid:
+            continue
+        # update index if seen
+        if tid in seen:
+            norm[seen[tid]] = (tid, reason)
+        else:
+            seen[tid] = len(norm)
+            norm.append((tid, reason))
+    return norm
+
+# ----------------------------------------------------------------------------
+# HTML output
+# ----------------------------------------------------------------------------
+def generate_html_report(
+    incident_no: Union[int, str],
+    incident_title: str,
+    query_result_rendered: Union[str, List[str]],
+    ABIPDB_analysis: str,
+    skipped_ip_analysis: str,
+    domain_analysis: str,
+    file_hash_analysis: str,
+    mitre_attack_map: str,
+) -> str:
+    """Assemble final HTML report."""
+
+    if all(not (x or "").strip() for x in [ABIPDB_analysis, skipped_ip_analysis, domain_analysis, file_hash_analysis]):
+        osint_checks_html = "<p>N/A</p>"
     else:
-        techniques = techniques_llm
+        osint_checks_html = f"{ABIPDB_analysis}{skipped_ip_analysis}{domain_analysis}{file_hash_analysis}"
 
-    # Ensure consistent (id, desc) format
-    techniques = [
-        (t[0], t[1] if len(t) == 2 and t[1].strip() else "")
-        if isinstance(t, tuple) else (t, "")
-        for t in techniques
-    ]
-
-    # Deduplicate by first element of tuple (technique ID), keeping the last occurrence
-    return list({t[0]: t for t in techniques}.values())
-
-# ------------ HTML Output Functions ------------ #
-def generate_html_report(Incident_no, Incident_title, query_result, ABIPDB_analysis, skipped_ip_analysis, domain_analysis, file_hash_analysis, mitre_attack_map):
-
-    # If all OSINT check results are blank, set output to N/A
-    if all(not x.strip() for x in [ABIPDB_analysis, skipped_ip_analysis, domain_analysis, file_hash_analysis]):
-        osint_checks = "<p>N/A</p>"
+    # Normalize query result into HTML
+    if isinstance(query_result_rendered, list):
+        # If items already contain <p> links, join as-is; else wrap in <pre>
+        if any("<p>" in str(item) for item in query_result_rendered):
+            qr_html = "".join(str(item) for item in query_result_rendered if str(item).strip())
+        else:
+            qr_html = "<pre>" + "<br /><br />".join(str(q) for q in query_result_rendered if str(q).strip()) + "</pre>"
     else:
-        osint_checks = f"{ABIPDB_analysis}{skipped_ip_analysis}{domain_analysis}{file_hash_analysis}"
-    
-    # If query_result is a list (where multiple detection queries was run), join its items; if not, just use it directly
-    if isinstance(query_result, list) and all("<p>" not in str(item) for item in query_result):
-        # Add a separator or header for clarity if desired:
-        qr_string = "<pre>" + "<br /><br />".join(str(q) for q in query_result if str(q).strip()) + "</pre>"
-    elif isinstance(query_result, list) and any("<p>" in str(item) for item in query_result):
-        # If query_result is a list with HTML links, join them as they are as they already have <p> tags
-        qr_string = "".join(str(item) for item in query_result if str(item).strip())
-    elif "<br />" in str(query_result): # If query_result is a table
-        qr_string = "<pre>" + str(query_result) + "</pre>"
-    elif "<p>" in str(query_result):   # if query_table is an alert link
-        qr_string = str(query_result)
+        s = str(query_result_rendered)
+        if "<p>" in s and "<br />" not in s:
+            qr_html = s
+        else:
+            qr_html = "<pre>" + s + "</pre>"
 
-    html_content = html_content = f"""<h1>Incident: {Incident_no} - {Incident_title}</h1>
+    html_content = f"""
+    <h1>Incident: {escape(str(incident_no))} - {escape(incident_title)}</h1>
     <h2>Events</h2>
-    {qr_string}
+    {qr_html}
     <h2>OSINT Checks</h2>
-    {osint_checks}{mitre_attack_map}
+    {osint_checks_html}
+    {mitre_attack_map}
     <h2>Investigation Notes</h2>
     <p>&nbsp;</p>
     <h2>Conclusion</h2>
@@ -659,243 +696,257 @@ def generate_html_report(Incident_no, Incident_title, query_result, ABIPDB_analy
     <h2>Next Course of Action</h2>
     <p>&nbsp;</p>
     """
-    
     return html_content
 
-# ------------ Run Script ------------ #
-def main_menu():
+
+# ----------------------------------------------------------------------------
+# Orchestration
+# ----------------------------------------------------------------------------
+def main_menu() -> str:
     while True:
-        beep()    # Play a notification sound for user attention
+        beep()
         print("\nMain Menu:")
         print("1. Use Azure Monitor Logs to obtain the detection query results")
-        print("2. Use a CSV file containing the query results or enter event details manually (you will be prompted if you wish to select a CSV file or enter the event details manually using text input)")
-        print("3. Exit the tool")
+        print("2. Use a CSV file or paste event details manually")
+        print("3. Exit")
         choice = input("Enter your choice (1/2/3): ").strip()
-        
-        if choice == '1':
-            # Handle Azure Monitor Logs
-            beep()    # Play a notification sound for user attention
-            user_selection = input("You have selected to use Azure Monitor Logs. Do you wish to continue? (Y/N)\n " \
-                                    "Enter 'Y' to continue or 'N' to return to the main menu: ").strip().lower()
-            while user_selection not in ['yes', 'y', 'no', 'n']:
-                beep()    # Play a notification sound for user attention
-                user_selection = input("Invalid selection. Please enter 'yes' or 'no': ").strip().lower()
-            if user_selection in ['no', 'n']:
-                print("Returning to the main menu...")
-                continue
-            else:
-                return '1'  # Return to indicate Azure Monitor Logs selection
-        elif choice == '2':
-            # Handle CSV file input
-            beep()    # Play a notification sound for user attention
-            user_selection = input("You have selected to use a CSV file containing the query results. Do you wish to continue? (Y/N)\n " \
-                                    "Enter 'Y' to continue or 'N' to return to the main menu: ").strip().lower()
-            while user_selection not in ['yes', 'y', 'no', 'n']:
-                beep()    # Play a notification sound for user attention
-                user_selection = input("Invalid selection. Please enter 'Y' or 'N': ").strip().lower()
-            if user_selection in ['no', 'n']:
-                print("Returning to the main menu...")
-                continue
-            else:
-                return '2'  # Return to indicate CSV file selection
-        elif choice == '3':
-            print("You have selected to exit the tool")
-            return '3'  # Return to indicate exit
-        else:
-            print("Invalid selection. Please try again.")
+        if choice in {"1", "2", "3"}:
+            return choice
+        logging.error("Invalid selection. Please enter 1, 2, or 3.")
 
-def format_elapsed(seconds: float) -> str:
-    """Format elapsed time as M min S sec."""
-    minutes = int(seconds // 60)
-    sec = seconds % 60
-    if minutes > 0:
-        return f"{minutes}m {sec:.2f}s"
-    else:
-        return f"{sec:.2f}s"
 
-if __name__ == '__main__':
+def get_query_results_from_file() -> Tuple[str, Path]:
+    """Prompt user to select a CSV, return rendered HTML text and preview JSON path."""
+    print("Please select a CSV file containing the query results.")
+
+    csv_path = select_csv_via_gui()
+    if not csv_path:
+        print("No file selected. Exiting.")
+        sys.exit(1)
+
+    # raw text for HTML view
+    raw = csv_path.read_text(encoding="utf-8-sig").replace("\n", "<br />")
+
+    # preview JSON path
+    preview_json = Path("query_result.json")
     try:
+        df = pd.read_csv(csv_path)
+        df.head().to_json(preview_json, orient="records", indent=2, force_ascii=False)
+    except Exception as e:
+        logging.warning("Failed to generate JSON preview from CSV: %s", e)
 
-        start_time = time.perf_counter()  # start timer
+    return raw, preview_json
 
-        osint_checks = False # Flag to indicate if OSINT checks are performed
 
-        # Load the configuration file to get the queries for incident details
-        config = load_config('config.yaml')  # Load the configuration file
+def run() -> None:
+    setup_logging(verbose=True)
 
-        # Allow the user to login to Azure and add the workspaces to a variable for user selection
-        print("\nWelcome to the Alert Documentation Tool!")
-        print("This tool will help you generate an HTML report based on the detection query results.")
-        print("You will be able to select if you want to use the Azure Monitor Logs or a CSV file containing the query results.")
+    start_time = time.perf_counter()
+    osint_needed = False
 
-        user_selection = main_menu()
+    print("\nWelcome to the Alert Documentation Tool!")
+    print("This tool will generate an HTML report from detection query results.")
+    choice = main_menu()
 
-        if user_selection == '1':
-            # This selection will run the azure_monitor_logs_query_tool CLI to login to Azure and grab the detection query results
+    # Load query config (YAML recommended)
+    cfg = load_config("config.yaml")
 
-            # ---------------- Azure Monitor Logs Selection ------------ #
-
-                # Close any instances of the query_table.csv file before proceeding
+    if choice == "1":
+        # Azure Monitor Logs path
+        if platform.system() == "Windows":
             close_excel_with_file_open("query_table")
-                # Start the login process into Azure using the azure_monitor_login CLI
-            
-            print("\nYou have selected to use Azure Monitor Logs. Please ensure you have the necessary permissions to access the logs (recommended minimum: Log Analytics Reader role on the workspace).")
-                # Run the azure_monitor_login CLI to login to Azure to get the workspace ID
-            workspace_id = azure_monitor_login()
-                
-                # Get the incident details
-            incident_no = get_valid_incident_id()
-                
-                # Get the detection details including start time, end time, and query
-            print(f"\nRetrieving detection details for incident ID: {incident_no} in workspace ID: {workspace_id}")
 
-            query = config['incident_details_query'].format(incident_no=incident_no)
-            #print(f"Running query to get incident details:\n{query}\n")
-            result = _query_log_analytics(workspace_id, query, timespan="P1D", verify_tls=False)  # Run the query to get the incident details
-            
-            #if not result.get("rows"):
-            if not result or not any(t.get("rows") for t in result.get("tables", [])):
-                print("No results returned. Changing the time range from 1 day to 7 days")
-                result = _query_log_analytics(workspace_id, query, timespan="P7D", verify_tls=False)
-                #if not result.get("rows"):
-                if not result or not any(t.get("rows") for t in result.get("tables", [])):
-                    print("No results returned for time range of 7 days... Exiting the tool.")
-                    exit(0)
-            result = _extract_first_table(result)  # Extract the first table from the result
-            alerts, alert_id = prepare_results(result)  # Ensure result is in the expected format
-            
-            query = config['get_alert_link_query'].format(alert_id=alert_id)
-            incident_title, query_result, tactics, techniques, product_name, detection_query, query_result_json = run_detection_queries_on_alerts(alerts, workspace_id, query)  # Run detection queries on the alerts
-
-            if product_name.lower().endswith("sentinel"):
-                osint_checks = True # Set the flag to indicate OSINT checks will be performed on those alerts where the alert is from Sentinel
-
-                # ---------------- LLM MITRE ATT&CK Mapping and HTML Output ------------ #
-
-                # Read the events JSON file for the LLM prompt
-                with open(query_result_json, "r", encoding="utf-8") as f:
-                    query_result_json = json.load(f)
-                # Obfuscate the system information in the events for data privacy
-                #snippet_obj = obfuscate_json(query_result_json, json_fields={"AccountUPN","Host","Email"})
-                # Get the prompt template and format it with the detection query and incident title
-                prompt = config['PROMPT_TEMPLATE_FOR_MITRE_ATTACK_TECHNIQUES'].format(
-                    MITRE_VERSION=MITRE_VERSION, ALERT_DETAILS=f"KQL:\n{detection_query}\n\nEvents:\n{query_result_json}", ALERT_TITLE=incident_title
-                )
-
-                # ---------------- Investigation Query Pack ------------ #
-
-                print("\nQuerying relevent logs for investigation notes...")
-                # Extract entities from the alert
-                entities = investigation_query_pack.extract_entities(incident_title, query_result)
-                #print(entities)
-
+        print("\nYou selected Azure Monitor Logs.")
+        workspace_id = input("If known, enter the Log Analytics Workspace ID (or press Enter): ").strip()
+        if not workspace_id or not validate_workspace_id(workspace_id):
+            if prompt_yes_no("Login to Azure to retrieve the Workspace ID?"):
+                workspace_id = azure_monitor_login()
             else:
-                osint_checks = False  # Set the flag to indicate OSINT checks will not be performed on those alerts where the alert is not from Sentinel
-
-        elif user_selection == '2':
-            beep()    # Play a notification sound for user attention
-            csv_data_or_text = input("Do you wish to select a CSV file containing the query results or paste the incident details as text? (Enter 'csv' for file or 'text' for text): ").strip().lower()
-            while csv_data_or_text not in ['csv', 'text']:
-                beep()    # Play a notification sound for user attention
-                csv_data_or_text = input("Invalid selection. Please enter 'csv' for file or 'text' for text: ").strip().lower()
-            if csv_data_or_text == 'csv':
-                # Close any instances of the query_table.csv file before proceeding
-                close_excel_with_file_open("query_table")
-                # Get the query results from the CSV file
-                query_result, query_result_json = get_query_results_from_file()
-            else:
-                # If the user chooses to paste the incident details as text, prompt for the text input
-                print("Please paste the incident details below (end with an empty line):")
-                query_result = ""
+                # loop until valid manual entry
                 while True:
-                    line = input()
-                    if line.strip() == "":
+                    workspace_id = input("Please enter the Log Analytics Workspace ID: ").strip()
+                    if validate_workspace_id(workspace_id):
                         break
-                    query_result += line + "<br />"
-                query_result = query_result.strip()
-                query_result_json = query_result        # for consistency, set query_result_json to the same value as query_result for mitre_attack_details
-            
-            # Check if the query result is empty
-            if not query_result:
-                print("No query results found. Please ensure that the CSV file is in the correct format and contains the necessary data.")
-                exit(1)
+                    logging.error("Invalid Workspace ID format. Try again.")
+        logging.info("Using Workspace ID: %s", workspace_id)
 
-            beep()    # Play a notification sound for user attention
-            print("Please enter the incident number and title for the report.")
-            incident_no = input("Incident Number: ").strip()
-            beep()    # Play a notification sound for user attention
-            incident_title = input("Incident Title: ").strip()
-            osint_checks = True  # Set the flag to indicate OSINT checks will be performed
+        incident_no = get_valid_incident_id()
 
-            # Read the events JSON file for the LLM prompt
-            with open(query_result_json, "r", encoding="utf-8") as f:
-                query_result_json = json.load(f)
-            # Obfuscate the system information in the events for data privacy
-            #snippet_obj = obfuscate_json(query_result_json, json_fields={"AccountUPN","Host","Email"})
-            # Get the prompt template and format it with the detection query and incident title
-            prompt = config['PROMPT_TEMPLATE_FOR_MITRE_ATTACK_TECHNIQUES'].format(
-                MITRE_VERSION=MITRE_VERSION, ALERT_DETAILS=f"Events:\n{query_result_json}", ALERT_TITLE=incident_title
+        print(f"Retrieving detection details for Incident ID: {incident_no}")
+        q = cfg["incident_details_query"].format(incident_no=incident_no)
+        result = _query_log_analytics(workspace_id, q, timespan="P1D", verify_tls=False)
+
+        def _has_rows(res: Dict[str, Any]) -> bool:
+            return bool(res) and any(t.get("rows") for t in res.get("tables", []))
+
+        if not _has_rows(result):
+            logging.info("No results for 1 day. Trying 7 days...")
+            result = _query_log_analytics(workspace_id, q, timespan="P7D", verify_tls=False)
+            if not _has_rows(result):
+                print("No results for 7 days. Exiting.")
+                sys.exit(0)
+
+        table = _extract_first_table(result)
+        alerts, first_alert_id = prepare_results(table)
+
+        link_query = cfg["get_alert_link_query"].format(alert_id=first_alert_id)
+        incident_title, rendered, product_name, detection_query, json_preview = run_detection_queries_on_alerts(
+            alerts, workspace_id, link_query
+        )
+
+        # If alert is from Sentinel, we'll offer MITRE + OSINT on those events
+        if product_name.lower().endswith("sentinel"):
+            osint_needed = True
+
+            # Build MITRE prompt (use CSV preview JSON for events)
+            events_for_llm: Union[Path, str, List[Dict[str, Any]]]
+            if json_preview and json_preview.exists():
+                try:
+                    events_for_llm = json.loads(json_preview.read_text(encoding="utf-8"))
+                except Exception:
+                    events_for_llm = []
+            else:
+                events_for_llm = []
+
+            tmpl = Template(cfg["PROMPT_TEMPLATE_FOR_MITRE_ATTACK_TECHNIQUES"])
+            prompt = tmpl.substitute(
+                MITRE_VERSION=MITRE_VERSION,
+                ALERT_DETAILS=f"KQL:\n{detection_query}\n\nEvents:\n{events_for_llm}",
+                ALERT_TITLE=incident_title,
             )
 
-        elif user_selection == '3':
-            print("Exiting the tool. Goodbye!")
-            exit(0)
+        else:
+            osint_needed = False
+            prompt = ""  # no MITRE prompt if not Sentinel
 
-        # ---------------- LLM MITRE ATT&CK Mapping and HTML Output ------------ #
-        mitre_attack_map = prompt_for_mitre_attack_techniques(prompt, incident_title=incident_title, MITRE_VERSION=MITRE_VERSION)
-
-        # ---------------- OSINT Checks ------------ #
-
-        if osint_checks:        # Perform OSINT checks if the flag is set
-            # Prompt user for OSINT check confirmation with validation
+    elif choice == "2":
+        # CSV or text path
+        if prompt_yes_no("Use a CSV file (Yes) or paste text (No)?"):
+            query_result, preview_json_path = get_query_results_from_file()
+            try:
+                events_for_llm = json.loads(preview_json_path.read_text(encoding="utf-8"))
+            except Exception:
+                events_for_llm = []
+        else:
+            print("Paste the incident details below (end with an empty line):")
+            buf = []
             while True:
-                beep()    # Play a notification sound for user attention
-                user_choice = input(
-                    "📄 Please review the alert data in the generated Excel/CSV file first.\n"
-                    "Would you like to perform OSINT checks on the indicators in this data? (y/n): "
-                ).strip().lower()
-                if user_choice in ("y", "n"):
+                line = input()
+                if not line.strip():
                     break
-                else:
-                    beep()    # Play a notification sound for user attention
-                    print("❌ Invalid input. Please enter 'y' for yes or 'n' for no.")
-            if user_choice == "y":
-                print("[INFO] Starting OSINT checks...")
-                # Apply nest_asyncio to allow nested event loops
-                nest_asyncio.apply()
-                ABIPDB_analysis, skipped_ip_analysis, domain_analysis, hash_analysis = OSINT_check(query_result)  # Perform the OSINT checks
-            else:
-                print("[INFO] Skipping OSINT checks.")
-                # If OSINT checks are not performed, set the analysis variables to empty strings
-                ABIPDB_analysis = ""
-                skipped_ip_analysis = ""
-                domain_analysis = ""
-                hash_analysis = ""
-        else:       # If OSINT checks are not performed, set the analysis variables to empty strings
-            ABIPDB_analysis = ""
-            skipped_ip_analysis = ""
-            domain_analysis = ""
-            hash_analysis = ""
+                buf.append(line)
+            query_result = "<br />".join(buf).strip()
+            events_for_llm = []  # no structured JSON
+        incident_no = input("Incident Number: ").strip()
+        incident_title = input("Incident Title: ").strip()
+        osint_needed = True  # permitted against pasted/CSV content
 
-        # ---------------- HTML Build ------------ #
+        tmpl = Template(cfg["PROMPT_TEMPLATE_FOR_MITRE_ATTACK_TECHNIQUES"])
+        prompt = tmpl.substitute(
+            MITRE_VERSION=MITRE_VERSION,
+            ALERT_DETAILS=f"Events:\n{events_for_llm}",
+            ALERT_TITLE=incident_title,
+        )
 
-        # Build the HTML content
-            # Create an HTML file with the content and save it
-        with open("report.html", "w", encoding="utf-8") as file:
-            file.write(generate_html_report(incident_no, incident_title, query_result, ABIPDB_analysis, skipped_ip_analysis, domain_analysis, hash_analysis, mitre_attack_map))
-        print("\nHTML file 'report.html' created successfully.")
+        rendered = query_result  # already normalized for this branch
 
-        # ---------------- Show the completed HTML Report ------------ #
+    else:
+        print("Exiting. Goodbye!")
+        sys.exit(0)
 
-        # open the HTML file in browser
-        webbrowser.open("report.html")
+    # --- MITRE ATT&CK mapping (optional) ---
+    mitre_attack_map = ""
+    if prompt and prompt_yes_no("Perform MITRE ATT&CK mapping for this alert?"):
+        print("\nAttempting to find ATT&CK techniques using a local LLaMA3 (Ollama).")
+        print("====================\nPrompt sent to Ollama:\n====================")
+        print(prompt)
+        print("====================\n")
 
-        # ---------------- End Timer and Complete Execution ------------ #
-        end_time = time.perf_counter()  # end timer
-        elapsed = end_time - start_time
-        beep()    # Play a notification sound for user attention
-        print(f"⏱ Execution time: {format_elapsed(elapsed)}\n")
+        mitre_output = run_ollama(prompt)
+        if mitre_output != "s":
+            print("====================\nRaw output from Ollama:\n====================")
+            print(mitre_output)
+            print("====================\n")
+            techniques_llm = extract_techniques(mitre_output)
+            techniques_norm = normalize_techniques(techniques_llm, None)
+            logging.info("MITRE techniques parsed: %s", techniques_norm)
+            mitre_attack_map = mitre_attack_html_section(techniques_norm, MITRE_VERSION)
+        else:
+            logging.info("MITRE mapping skipped by user.")
 
+    # --- OSINT checks (optional) ---
+    if osint_needed:
+        print("\nPlease review the generated CSV/Excel first.")
+        do_osint = prompt_yes_no("Run OSINT checks on the indicators in this data?")
+        if do_osint:
+            logging.info("Starting OSINT checks...")
+            if _HAS_NEST_ASYNCIO:
+                try:
+                    nest_asyncio.apply()  # type: ignore
+                except Exception:
+                    pass
+            cfg = load_config("config.json")  # load config with API keys
+            ABIPDB, SKIP, DOM, HASH = osint_check(rendered, cfg)
+        else:
+            ABIPDB = SKIP = DOM = HASH = ""
+    else:
+        ABIPDB = SKIP = DOM = HASH = ""
+
+    # --- Build and show HTML report ---
+    html = generate_html_report(
+        incident_no=incident_no,
+        incident_title=incident_title,
+        query_result_rendered=rendered,
+        ABIPDB_analysis=ABIPDB,
+        skipped_ip_analysis=SKIP,
+        domain_analysis=DOM,
+        file_hash_analysis=HASH,
+        mitre_attack_map=mitre_attack_map,
+    )
+
+    REPORT_HTML.write_text(html, encoding="utf-8")
+    print(f"\nHTML report created: {REPORT_HTML}")
+    try:
+        import webbrowser
+        webbrowser.open(str(REPORT_HTML))
+    except Exception:
+        pass
+
+    elapsed = time.perf_counter() - start_time
+    beep()
+    print(f"⏱ Execution time: {format_elapsed(elapsed)}\n")
+
+    if choice == "1":
+        print(
+            "\nTo complete the investigation, you can use the CLI in the repo:\n"
+            "  UAB_workbook_runner_cli.py  (Azure-Sentinel-Workbooks)\n"
+            "This tool runs queries from User_Analytics_Behaviour.json against a Log Analytics workspace.\n\n"
+            "Repo: https://github.com/MYoussef23/Azure-Sentinel-Workbooks\n\n"
+            "Prereqs:\n"
+            "  • AZ CLI installed and logged in (e.g., `az account show` works)\n"
+            "  • `pip install fire requests`\n\n"
+            "Examples:\n"
+            "  # List queries (index + title)\n"
+            "  python UAB_workbook_runner_cli.py list --workbook_path User_Analytics_Behaviour.json\n\n"
+            "  # Run a query by index for the last 1 day (P1D) with a placeholder value\n"
+            "  python UAB_workbook_runner_cli.py run 7 <workspace_id_guid> P1D "
+            "--UserPrincipalName <UPN> --limit 50\n\n"
+            "  # Run and export all results to JSON\n"
+            "  python UAB_workbook_runner_cli.py run 12 <workspace_id_guid> P7D "
+            "--UserPrincipalName <UPN> --output json --outfile results.json\n\n"
+            "  # Save the rendered KQL to a .kql file (for review/sharing)\n"
+            "  python UAB_workbook_runner_cli.py run 3 <workspace_id_guid> P3D --save_rendered_kql True\n"
+        )
+
+def main() -> None:
+    try:
+        run()
+    except KeyboardInterrupt:
+        print("\nInterrupted by user.")
     except Exception as e:
-        beep()    # Play a notification sound for user attention
-        print(f"Execution error: {e}")
+        beep()
+        logging.exception("Execution error: %s", e)
+
+
+if __name__ == "__main__":
+    main()
