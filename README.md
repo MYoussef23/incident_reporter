@@ -7,7 +7,8 @@ The toolkit focuses on streamlining **incident reporting**, **OSINT enrichment**
 
 ## 📂 Repository Structure
 soc-automation-toolkit/
-├── incident_reporter_tool.py '#' Main tool: generates structured HTML reports for incidents
+
+├── incident_reporter_tool.py # Main tool: generates structured HTML reports for incidents
 ├── osint_scanner.py # Fire-based CLI for AbuseIPDB & VirusTotal enrichment
 ├── get_mitre_attack_details.py # Fetches MITRE ATT&CK STIX data & builds mappings
 ├── ollama_prompt.py # Safe wrapper for local Ollama LLM (JSON output, retries)
