@@ -519,4 +519,3 @@ if __name__ == "__main__":
 #   python osint_scanner.py domain --targets example.com test.org --org_domains example.com --output_csv results/vt_domains.csv
 #   python osint_scanner.py hash --targets d41d8cd98f00b204e9800998ecf8427e --output_csv results/vt_hashes.csv
 # =============================================================================
-
