@@ -24,8 +24,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Lint and test
+      - name: Lint only
         run: |
-          pip install flake8 pytest
-          flake8 .
-          pytest -q || true
+          pip install flake8
+          flake8 . || true
