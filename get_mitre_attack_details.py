@@ -14,6 +14,7 @@ import fire
 from rapidfuzz import fuzz
 import re
 import ast  # For safe parsing of string-formatted dict/lists from CLI
+from bs4 import BeautifulSoup
 
 import warnings
 from urllib3.exceptions import InsecureRequestWarning
@@ -72,25 +73,36 @@ def build_lookups(attack_store):
 
 def mitre_attack_html_section(techniques, MITRE_VERSION):
     """
-    Returns an HTML section listing MITRE ATT&CK tactics and techniques, 
-    mapped per technique ID and description.
+    Returns an HTML section listing MITRE ATT&CK tactics and techniques,
+    mapped per technique ID and optional description.
 
     Parameters:
-        techniques (list of tuple): List of (technique_id, description).
+        techniques: Iterable of either:
+          - strings: ["T1021.002", "T1210"], or
+          - (tech_id, description) pairs: [("T1021.002", "reason..."), ...]
     """
+    # --- normalize input to [(tech_id, desc), ...] ---
+    tech_pairs = []
+    for item in techniques:
+        if isinstance(item, str):
+            tech_pairs.append((item.strip(), ""))  # no description provided
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            tech_pairs.append((str(item[0]).strip(), str(item[1]).strip())) # (tech_id, desc)
+        else:
+            raise ValueError(
+                "Each technique must be a string like 'T####' or a (tech_id, description) pair."
+            )
 
-    # Define matrices
+    # Build lookups for filtering and descriptions
+    tech_ids = [tid for tid, _ in tech_pairs]
+    descriptions_map = {tid: desc for tid, desc in tech_pairs}
+
     matrices = {
         "enterprise-attack": "Enterprise",
         "ics-attack": "ICS",
         "mobile-attack": "Mobile",
     }
 
-    # Extract technique IDs and description mapping
-    tech_ids = [tech_id.strip() for tech_id, _ in techniques]
-    descriptions_map = {tech_id.strip(): desc.strip() for tech_id, desc in techniques}
-
-    # Build the full table across all domains
     rows = []
     for matrix_key, matrix_name in matrices.items():
         try:
@@ -102,12 +114,12 @@ def mitre_attack_html_section(techniques, MITRE_VERSION):
         techs, tactic_lookup = build_lookups(attack_store)
 
         for tech in techs.values():
-            tech_id = tech['tech_id']
-            tech_name = tech['name']
-            tech_url = tech.get('url', '')
-            tactics = [tactic_lookup.get(t, t) for t in tech['tactics']]
+            tech_id = tech["tech_id"]
+            tech_name = tech["name"]
+            tech_url = tech.get("url", "")
+            tactics = [tactic_lookup.get(t, t) for t in tech["tactics"]]
 
-            # Embed the URL as a clickable link
+            # Clickable link when available
             if tech_url:
                 technique_display = f'<a href="{tech_url}" target="_blank">{tech_id}: {tech_name}</a>'
             else:
@@ -118,36 +130,90 @@ def mitre_attack_html_section(techniques, MITRE_VERSION):
                 "Tactic": ", ".join(tactics),
                 "Technique": technique_display,
                 "TechID": tech_id,
-                "Relevance to the Alert": descriptions_map.get(tech_id, "")
+                "Relevance to the Alert": descriptions_map.get(tech_id, ""),
             })
 
-    # Create DataFrame
-    df = pd.DataFrame(rows, columns=["Matrix", "Tactic", "Technique", "TechID", "Relevance to the Alert"])
+    # Check if description is present
+    if any(desc for _, desc in tech_pairs):
+        df = pd.DataFrame(rows, columns=["Matrix", "Tactic", "Technique", "TechID", "Relevance to the Alert"])
+    else:
+        df = pd.DataFrame(rows, columns=["Matrix", "Tactic", "Technique", "TechID"])
 
-    # Filter by technique ID
-    mask_tech = df["TechID"].isin(tech_ids)
-    filtered_df = df[mask_tech]
+    # Filter by requested technique IDs
+    filtered_df = df[df["TechID"].isin(tech_ids)].copy()
 
-    # Save CSV without TechID column
-    filtered_df.drop(columns=["TechID"], inplace=True)
-    filtered_df.to_csv("mitre_techniques_filtered.csv", index=False, encoding="utf-8")
+    if filtered_df.empty:
+        print("No matching MITRE ATT&CK techniques found for the provided IDs.")
+        return ""
 
-    # Build HTML table
+    # Save CSV without the TechID helper column
+    filtered_df_no_id = filtered_df.drop(columns=["TechID"])
+    filtered_df_no_id.to_csv("mitre_techniques_filtered.csv", index=False, encoding="utf-8")
+
     html_h2 = "<h2>MITRE ATT&CK Mapping</h2>"
-    html_table = f"{html_h2}\n{filtered_df.to_html(index=False, escape=False)}"
+    html_table = f"{html_h2}\n{filtered_df_no_id.to_html(index=False, escape=False)}"
 
-    # Console print
-    print("Matrix | Tactic | Technique | Relevance to the Alert | URL")
+    # Console view with extracted URLs
+    # if any(desc for _, desc in tech_pairs):
+    #     print("Matrix | Tactic | Technique | Relevance to the Alert | URL")
+    #     for _, row in filtered_df.iterrows():
+    #         soup = BeautifulSoup(row["Technique"], "html.parser")
+    #         link = soup.a["href"] if soup.a else ""
+    #         text = soup.a.text if soup.a else row["Technique"]
+    #         print(f"{row['Matrix']} | {row['Tactic']} | {text} | {row['Relevance to the Alert']} | {link}")
+    # else:
+    #     print("Matrix | Tactic | Technique | URL")
+    #     for _, row in filtered_df.iterrows():
+    #         soup = BeautifulSoup(row["Technique"], "html.parser")
+    #         link = soup.a["href"] if soup.a else ""
+    #         text = soup.a.text if soup.a else row["Technique"]
+    #         print(f"{row['Matrix']} | {row['Tactic']} | {text} | {link}")
+
+    # Define headers
+    if any(desc for _, desc in tech_pairs):
+        headers = ["Matrix", "Tactic", "Technique", "Relevance to the Alert", "URL"]
+    else:
+        headers = ["Matrix", "Tactic", "Technique", "URL"]
+
+    # Extract rows with clean text + URL
+    rows_out = []
     for _, row in filtered_df.iterrows():
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(row['Technique'], 'html.parser')
-        link = soup.a['href'] if soup.a else ''
-        text = soup.a.text if soup.a else row['Technique']
-        print(f"{row['Matrix']} | {row['Tactic']} | {text} | {row['Relevance to the Alert']} | {link}")
+        soup = BeautifulSoup(row["Technique"], "html.parser")
+        link = soup.a["href"] if soup.a else ""
+        text = soup.a.text if soup.a else row["Technique"]
+        if any(desc for _, desc in tech_pairs):
+            rows_out.append([
+                str(row["Matrix"]),
+                str(row["Tactic"]),
+                text,
+                str(row["Relevance to the Alert"]),
+                link,
+            ])
+        else:
+            rows_out.append([
+                str(row["Matrix"]),
+                str(row["Tactic"]),
+                text,
+                link,
+            ])
+
+    # Compute column widths
+    col_widths = [max(len(str(x)) for x in col) for col in zip(*([headers] + rows_out))]
+
+    # Build header and separator
+    header = " | ".join(h.ljust(col_widths[i]) for i, h in enumerate(headers))
+    sep = "-+-".join("-" * col_widths[i] for i in range(len(headers)))
+
+    # Print table
+    print(header)
+    print(sep)
+    for r in rows_out:
+        print(" | ".join(str(r[i]).ljust(col_widths[i]) for i in range(len(headers))))
+
 
     return html_table
 
-def find_matching_techniques(alert_title, data_block, min_score=100):
+def find_matching_techniques(alert_title, data_block, min_score=100, MITRE_VERSION="17.1"):
     """
     Returns a list of MITRE techniques matching keywords in the alert title and data_block
     across all ATT&CK matrices.
@@ -177,7 +243,7 @@ def find_matching_techniques(alert_title, data_block, min_score=100):
     # 2. Search techniques in all matrices
     all_results = []
     for matrix_key, matrix_name in matrices.items():
-        attack_store = get_attack_store(matrix_key)
+        attack_store = get_attack_store(matrix_key, MITRE_VERSION)
         for t in attack_store.query([Filter("type", "=", "attack-pattern")]):
             fields = [
                 t.get("name", ""),
@@ -214,11 +280,11 @@ def find_matching_techniques(alert_title, data_block, min_score=100):
         print(f"  Keywords matched: {r['matched_keywords']}\n")
     
     # show as HTML section
-    html_table = mitre_attack_html_section([r['tech_id'] for r in all_results[:10] if r['tech_id']])
+    html_table = mitre_attack_html_section([r['tech_id'] for r in all_results[:10] if r['tech_id']], MITRE_VERSION=MITRE_VERSION)
     
     return html_table
 
-def main(techniques=None, alert_title=None, data_block=None, min_score=70):
+def main(techniques=None, alert_title=None, data_block=None, min_score=70, mitre_version="17.1"):
     """
     Usage:
       --techniques=T1021.002,T1210
@@ -234,14 +300,14 @@ def main(techniques=None, alert_title=None, data_block=None, min_score=70):
     if alert_title:
         print("Finding matching MITRE ATT&CK techniques for the alert...")
         #attack_store = get_attack_store("enterprise-attack")
-        find_matching_techniques(alert_title, data_block or {}, min_score=int(min_score))
+        find_matching_techniques(alert_title, data_block or {}, min_score=int(min_score), MITRE_VERSION=mitre_version)
         return
 
     # 2. Original behavior: display known techniques
     if techniques:
         if isinstance(techniques, str):
             techniques = [t.strip() for t in techniques.split(",")]
-        mitre_attack_html_section(techniques)
+        mitre_attack_html_section(techniques, MITRE_VERSION=mitre_version)
     
     #export_matrix_to_csv("ics-attack", "ics_attack_techniques.csv")    # Uncomment to export ICS techniques to CSV
 
