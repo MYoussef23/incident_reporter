@@ -68,16 +68,22 @@ def get_org_cidrs() -> list[ipaddress._BaseNetwork]:
 
 def validate_IP(ip: str, org_cidrs: Optional[Iterable[ipaddress._BaseNetwork]] = None) -> bool:
     """
-    True if IP is public and not inside any provided org_cidrs.
-    False if private/invalid or within org_cidrs.
+    True if IP is:
+      - valid
+      - public (global)
+      - not inside org_cidrs
+    False otherwise.
     """
     try:
         ip_obj = ipaddress.ip_address(ip)
+        # Must be a global (public) address
+        if not ip_obj.is_global:
+            return False
         if org_cidrs:
             for net in org_cidrs:
                 if ip_obj in net:
                     return False
-        return ip_obj.is_global
+        return True
     except ValueError:
         return False
 
@@ -176,7 +182,9 @@ def loop_domain_vt_check(api_key: str, domain_list: list[str], org_cidrs: list[s
     scanner = OSINTScanner()
     result = scanner.domain(targets=domain_list, 
                             vt_api_key=api_key,
-                            org_cidrs=[str(c) for c in org_cidrs])
+                            org_cidrs=[str(c) for c in org_cidrs]) if org_cidrs else None
+    if not result:
+        return (None, None)
     return result["header"], result["rows"]
 
 def loop_file_hash_vt_check(api_key: str, file_hash_list: list[str]):
@@ -187,6 +195,23 @@ def loop_file_hash_vt_check(api_key: str, file_hash_list: list[str]):
     scanner = OSINTScanner()
     result = scanner.hash(targets=file_hash_list, vt_api_key=api_key)
     return result["header"], result["rows"]
+
+def _coerce_hash_targets(targets) -> list[str]:
+    # If a single string was provided, split on commas and whitespace/newlines
+    if isinstance(targets, str):
+        # allow: "hash1,hash2" or "hash1 hash2" or lines
+        parts = []
+        for chunk in targets.replace(",", " ").split():
+            t = chunk.strip().strip('"').strip("'")
+            if t:
+                parts.append(t)
+        return parts
+    # If already an iterable (list/tuple/set), make a list
+    try:
+        return [t.strip() for t in targets if str(t).strip()]
+    except TypeError:
+        # Not iterable: treat it as a single value
+        return [str(targets).strip()]
 
 
 # =============================================================================
@@ -224,6 +249,12 @@ def loop_abuseIP_check(api_key: str, ip_list: list[str], org_cidrs: list[str] | 
                         org_cidrs=[str(c) for c in org_cidrs], 
                         print_json=False)
     return result["header"], result["rows"], org_cidrs, result["skipped_by_cidr"]
+
+def _coerce_targets(targets: Iterable[str] | str) -> List[str]:
+    if isinstance(targets, str):
+        # split on commas or whitespace
+        return [t for t in re.split(r'[,\s]+', targets) if t]
+    return list(targets)
 
 # =============================================================================
 # CSV helper
@@ -305,6 +336,7 @@ class OSINTScanner:
         already_checked_cidrs: set[str] = set()
         skipped_by_cidr: Dict[str, List[str]] = defaultdict(list)
 
+        targets = _coerce_targets(targets)
         for ip in targets:
             if not validate_IP(ip, nets):
                 continue
@@ -450,7 +482,10 @@ class OSINTScanner:
         header: Optional[List[str]] = None
         rows: List[List[Any]] = []
 
-        for h in targets:
+        # 🔧 Normalize targets first
+        hash_list = _coerce_hash_targets(targets)
+
+        for h in hash_list:
             if not validate_hash(h):
                 print(f"Skipping invalid hash: {h}")
                 continue
@@ -466,39 +501,46 @@ class OSINTScanner:
                 if header is None:
                     header = [
                         "file_hash",
+                        "link",
                         "filename",
                         "file_type",
                         "file_size",
                         "last_analysis_stats",
                         "sandbox_verdict",
                         "last_analysis_date",
+                        "signature_info"
                     ]
                 filename = getattr(file_obj, "meaningful_name", "")
+                link = f"https://www.virustotal.com/gui/file/{h}"
                 file_type = getattr(file_obj, "type_description", "")
                 file_size = getattr(file_obj, "size", "")
                 last_analysis_stats = getattr(file_obj, "last_analysis_stats", {}) or {}
                 stats_str = ";".join(f"{k}:{v}" for k, v in last_analysis_stats.items())
                 last_analysis_date = getattr(file_obj, "last_analysis_date", "")
+                signature_info = getattr(file_obj, "signature_info", "")
                 sbox = vt_print_sandbox_verdict(file_obj)
 
-                row = [h, filename, file_type, file_size, stats_str, sbox, last_analysis_date]
+                row = [h, filename, link, file_type, file_size, stats_str, sbox, last_analysis_date, signature_info]
                 rows.append(row)
 
-                print(f"-------- Results for File Hash: {h} --------")
+                print(f"\n-------- VirusTotal Hash Results: {h} --------")
                 print(f"Filename: {filename}")
+                print(f"Link: {link}")
                 print(f"File Type: {file_type}")
                 print(f"File Size: {file_size}")
                 print(f"Last Analysis Statistics: {stats_str}")
                 print(f"Last Analysis Date: {last_analysis_date}")
+                print(f"Signature Info: {signature_info}")
+                print(f"Sandbox Verdicts: {sbox or 'None'}\n")
             else:
                 print(f"Failed to retrieve data for file hash: {h}")
 
             time.sleep(0.5)
 
-        print("\nVirusTotal Hash Results:")
-        print(header or [])
-        for r in rows:
-            print(r)
+        #print("\nVirusTotal Hash Results:")
+        #print(header or [])
+        # for r in rows:
+        #     print(r)
 
         if output_csv and header:
             _write_csv(output_csv, header, rows)
@@ -509,13 +551,14 @@ class OSINTScanner:
 if __name__ == "__main__":
     # pip install fire
     import fire
-    fire.Fire(OSINTScanner)
+    fire.Fire({"ip": OSINTScanner().ip, "domain": OSINTScanner().domain, "hash": OSINTScanner().hash})
 # =============================================================================
 # Example usage:
-#   python osint_scanner.py ip --targets
-#   python osint_scanner.py domain --targets
-#   python osint_scanner.py hash --targets
-#   python osint_scanner.py ip --targets 8.8.8.8 1.1.1.1 --org_cidrs 203.0.113.0/24 198.51.100.0/24 --output_csv results/abuseipdb_ips.csv
+#   python osint_scanner.py ip --targets --abuseipdb_api_key YOUR_KEY
+#   python osint_scanner.py domain --targets --vt_api_key YOUR_KEY
+#   python osint_scanner.py hash --targets --vt_api_key YOUR_KEY
+#   python osint_scanner.py ip --targets 8.8.8.8 1.1.1.1 --org_cidrs 203.0.113.0/24 198.51.100.0/24 --output_csv results/abuseipdb_ips.csv --abuseipdb_api_key YOUR_KEY
 #   python osint_scanner.py domain --targets example.com test.org --org_domains example.com --output_csv results/vt_domains.csv
 #   python osint_scanner.py hash --targets d41d8cd98f00b204e9800998ecf8427e --output_csv results/vt_hashes.csv
 # =============================================================================
+
