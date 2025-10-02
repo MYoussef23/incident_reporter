@@ -97,6 +97,27 @@ def validate_workspace_id(workspace_id: str) -> bool:
     """Validate the Log Analytics workspace GUID format."""
     return bool(re.match(r"^[0-9a-fA-F-]{36}$", workspace_id or ""))
 
+def validate_tenant_id(tenant_id: str) -> bool:
+    """
+    Validate an Azure tenant identifier.
+    Accepts either a GUID (tenant ID) or a domain name (verified domain).
+    """
+    # GUID pattern (with dashes)
+    guid_pattern = re.compile(
+        r"^[0-9a-fA-F]{8}-"
+        r"[0-9a-fA-F]{4}-"
+        r"[0-9a-fA-F]{4}-"
+        r"[0-9a-fA-F]{4}-"
+        r"[0-9a-fA-F]{12}$"
+    )
+
+    # Simple domain pattern (e.g., contoso.com, qr.com.au)
+    domain_pattern = re.compile(
+        r"^(?=.{1,255}$)(?!-)([A-Za-z0-9-]{1,63}\.)+[A-Za-z]{2,63}$"
+    )
+
+    return bool(guid_pattern.match(tenant_id) or domain_pattern.match(tenant_id))
+
 
 def format_elapsed(seconds: float) -> str:
     """Format elapsed time as M min S sec."""
@@ -378,6 +399,7 @@ def run_detection_queries_on_alerts(
     alerts: Sequence[Dict[str, Any]],
     workspace_id: str,
     alert_link_query: str,
+    tenant_id: Optional[str] = None
 ) -> Tuple[str, List[str], Any, Any, str, Optional[str], Optional[Path]]:
     """
     For Sentinel alerts, run detection queries and save results to CSV/JSON.
@@ -401,7 +423,7 @@ def run_detection_queries_on_alerts(
         if product_name.lower().endswith("sentinel"):
             logging.info("Running detection query for Alert %d: %s (%s)", idx, incident_title, alert_id)
             timespan = f"{start_time_utc}/{end_time_utc}"
-            table = _query_log_analytics(workspace_id, detection_query, timespan, verify_tls=False)
+            table = _query_log_analytics(workspace_id=workspace_id, query=detection_query, timespan=timespan, verify_tls=False, tenant_id=tenant_id)
             table = _extract_first_table(table)
 
             csv_path = Path(f"query_table_alert_{idx}.csv")
@@ -757,31 +779,34 @@ def run() -> None:
             close_excel_with_file_open("query_table")
 
         print("\nYou selected Azure Monitor Logs.")
-        workspace_id = input("If known, enter the Log Analytics Workspace ID (or press Enter): ").strip()
-        if not workspace_id or not validate_workspace_id(workspace_id):
-            if prompt_yes_no("Login to Azure to retrieve the Workspace ID?"):
-                workspace_id = azure_monitor_login()
-            else:
-                # loop until valid manual entry
-                while True:
-                    workspace_id = input("Please enter the Log Analytics Workspace ID: ").strip()
-                    if validate_workspace_id(workspace_id):
-                        break
-                    logging.error("Invalid Workspace ID format. Try again.")
-        logging.info("Using Workspace ID: %s", workspace_id)
+        tenant_id = input("Enter the Azure Tenant ID (as a GUID) or domain (or press Enter): ").strip()
+        if tenant_id and validate_tenant_id(tenant_id):
+            workspace_id, tenant_id = azure_monitor_login(tenant_id=tenant_id)
+        elif tenant_id == "":
+            if prompt_yes_no("Would you like to login to Azure to retrieve the Workspace ID for the tenant?"):
+                workspace_id, tenant_id = azure_monitor_login(tenant_id=tenant_id)
+        else:
+            # loop until valid manual entry
+            while True:
+                tenant_id = input("Please enter the Tenant ID: ").strip()
+                if validate_tenant_id(tenant_id):
+                    workspace_id, tenant_id = azure_monitor_login(tenant_id=tenant_id)
+                    break
+                logging.error("Invalid Tenant ID format. Try again.")
+        logging.info("Using Tenant ID: %s", tenant_id)
 
         incident_no = get_valid_incident_id()
 
         print(f"Retrieving detection details for Incident ID: {incident_no}")
         q = cfg["incident_details_query"].format(incident_no=incident_no)
-        result = _query_log_analytics(workspace_id, q, timespan="P1D", verify_tls=False)
+        result = _query_log_analytics(workspace_id=workspace_id, query=q, timespan="P1D", verify_tls=False, tenant_id=tenant_id)
 
         def _has_rows(res: Dict[str, Any]) -> bool:
             return bool(res) and any(t.get("rows") for t in res.get("tables", []))
 
         if not _has_rows(result):
             logging.info("No results for 1 day. Trying 7 days...")
-            result = _query_log_analytics(workspace_id, q, timespan="P7D", verify_tls=False)
+            result = _query_log_analytics(workspace_id=workspace_id, query=q, timespan="P7D", verify_tls=False, tenant_id=tenant_id)
             if not _has_rows(result):
                 print("No results for 7 days. Exiting.")
                 sys.exit(0)
@@ -791,7 +816,7 @@ def run() -> None:
 
         link_query = cfg["get_alert_link_query"].format(alert_id=first_alert_id)
         incident_title, rendered, product_name, detection_query, json_preview = run_detection_queries_on_alerts(
-            alerts, workspace_id, link_query
+            alerts=alerts, workspace_id=workspace_id, alert_link_query=link_query, tenant_id=tenant_id
         )
 
         # If alert is from Sentinel, we'll offer MITRE + OSINT on those events
@@ -836,7 +861,7 @@ def run() -> None:
                     break
                 buf.append(line)
             query_result = "<br />".join(buf).strip()
-            events_for_llm = []  # no structured JSON
+            events_for_llm = query_result  # no structured JSON
         incident_no = input("Incident Number: ").strip()
         incident_title = input("Incident Title: ").strip()
         osint_needed = True  # permitted against pasted/CSV content
@@ -862,13 +887,16 @@ def run() -> None:
         print(prompt)
         print("====================\n")
 
-        mitre_output = run_ollama(prompt)
+        #load ollama api key
+        cfg = load_config("config.json")  # load config with API keys
+        ollama_api_key = cfg["ollama_api_key"]
+        mitre_output = run_ollama(prompt, ollama_api_key=ollama_api_key, ollama_model="gpt-oss:120b")
         if mitre_output != "s":
             print("====================\nRaw output from Ollama:\n====================")
             print(mitre_output)
             print("====================\n")
             techniques_llm = extract_techniques(mitre_output)
-            techniques_norm = normalize_techniques(techniques_llm, None)
+            techniques_norm = normalize_techniques(techniques_llm, None)    
             logging.info("MITRE techniques parsed: %s", techniques_norm)
             mitre_attack_map = mitre_attack_html_section(techniques_norm, MITRE_VERSION)
         else:
