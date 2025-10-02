@@ -11,12 +11,13 @@ requires structured JSON responses from a local model.
 #!/usr/bin/env python3
 import os
 import time
-import ollama
+from ollama import Client
 import fire  # pip install fire
 import beep
 
 # Force the client to talk only to localhost
-os.environ["OLLAMA_HOST"] = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
+#os.environ["OLLAMA_HOST"] = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
+#os.environ["OLLAMA_HOST"] = "https://ollama.com"
 
 def _looks_like_memory_error(err_msg: str) -> bool:
     msg = err_msg.lower()
@@ -32,7 +33,8 @@ def _looks_like_memory_error(err_msg: str) -> bool:
         ]
     )
 
-def run_ollama(prompt: str, ollama_model: str = "llama3.1:latest", max_retries: int = 3) -> str:
+def run_ollama(prompt: str, ollama_model: str = "gpt-oss:120b", max_retries: int = 3, ollama_api_key: str = None) -> str:        # llama3.1:latest for local
+
     """
     Call Ollama safely. If a failure occurs (esp. memory/OOM), prompt the user to
     close apps to free memory and press Enter to retry. Returns "" on final failure.
@@ -41,22 +43,43 @@ def run_ollama(prompt: str, ollama_model: str = "llama3.1:latest", max_retries: 
     attempt = 1
     while attempt <= max_retries:
         try:
-            print(f"\n[Prompting Ollama local LLM: {ollama_model}]\n")
-            resp = ollama.chat(
-                model=ollama_model,
-                messages=[{"role": "user", "content": prompt}],
-                stream=False,
-                options={
-                    # Guardrails: low-variance decoding & short outputs
-                    "temperature": 0.1,
-                    "top_p": 0.9,
-                    "num_predict": 200,
-                    "num_ctx": 4096,  # reduce to 2048 if you hit OOM
-                    "num_thread": os.cpu_count() or 4,
-                },
-                format="json"  # asks Ollama to produce JSON
-            )
-            return resp["message"]["content"]
+            if ollama_model == "gpt-oss:120b":  # on cloud - default
+                print(f"\n[Prompting Ollama cloud LLM: {ollama_model}]\n")
+                client = Client(host="https://ollama.com/", headers={'Authorization': ollama_api_key}, verify=False)
+                resp = client.chat(
+                    model=ollama_model,
+                    messages=[{"role": "user", "content": prompt}],
+                    stream=True,
+                    format="json"  # asks Ollama to produce JSON
+                )
+                response_message = ""
+                for part in resp:
+                    # Add to return message if needed
+                    response_message += part['message']['content']
+            elif ollama_model == "llama3.1:latest":  # local
+                print(f"\n[Prompting Ollama local LLM: {ollama_model}]\n")
+                client = Client(verify=False)
+                resp = client.chat(
+                    model=ollama_model,
+                    messages=[{"role": "user", "content": prompt}],
+                    stream=True,
+                    options={
+                        # Guardrails: low-variance decoding & short outputs
+                        "temperature": 0.1,
+                        "top_p": 0.9,
+                        "num_predict": 200,
+                        "num_ctx": 4096,  # reduce to 2048 if you hit OOM
+                        "num_thread": os.cpu_count() or 4,
+                    },
+                    format="json"  # asks Ollama to produce JSON
+                )
+                response_message = ""
+                for part in resp:
+                    # Add to return message if needed
+                    response_message += part['message']['content']
+                return response_message
+
+            #return resp["message"]["content"]
         except Exception as e:
             err = str(e)
             print(f"[WARN] Ollama call failed (attempt {attempt}/{max_retries}): {err}")
